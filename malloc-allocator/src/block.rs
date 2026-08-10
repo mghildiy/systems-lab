@@ -32,7 +32,8 @@ impl BlockHeader {
 
 pub(crate) unsafe fn write_header(addr: *mut u8, size: usize, allocated: bool) {
     let header_addr = addr as *mut BlockHeader;
-    unsafe {*header_addr = BlockHeader::new(size, allocated)};
+    let block_header = BlockHeader::new(size, allocated);
+    unsafe { header_addr.write(block_header) }
 }
 
 pub(crate) unsafe fn read_header(addr: *mut u8) -> (usize, bool) {

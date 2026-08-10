@@ -3,7 +3,7 @@ use std::ptr;
 use std::sync::OnceLock;
 
 static PAGE_SIZE: OnceLock<usize> = OnceLock::new();
-fn page_size() -> usize {
+pub(crate) fn page_size() -> usize {
     *PAGE_SIZE.get_or_init(|| unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize })
 }
 pub(crate) unsafe fn map_pages(num_pages: usize) -> Option<*mut u8> {
