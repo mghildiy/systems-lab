@@ -1,16 +1,13 @@
-
-
 const ALLOC_FLAG_MASK: usize = 1;
 
 struct BlockHeader {
-    packed: usize
+    packed: usize,
 }
 
 impl BlockHeader {
-
     fn new(size: usize, allocated: bool) -> Self {
         BlockHeader {
-            packed: size | if allocated { ALLOC_FLAG_MASK } else { 0 }
+            packed: size | if allocated { ALLOC_FLAG_MASK } else { 0 },
         }
     }
 
@@ -21,11 +18,11 @@ impl BlockHeader {
             self.packed = self.packed & !ALLOC_FLAG_MASK
         }
     }
-    fn size(&self) -> usize {
+    pub(crate) fn size(&self) -> usize {
         self.packed & !ALLOC_FLAG_MASK
     }
 
-    fn is_allocated(&self) -> bool {
+    pub(crate) fn is_allocated(&self) -> bool {
         (self.packed & ALLOC_FLAG_MASK) != 0
     }
 }
@@ -38,14 +35,14 @@ pub(crate) unsafe fn write_header(addr: *mut u8, size: usize, allocated: bool) {
 
 pub(crate) unsafe fn read_header(addr: *mut u8) -> (usize, bool) {
     let header_addr = addr as *mut BlockHeader;
-    let header = unsafe {&*header_addr};
+    let header = unsafe { &*header_addr };
     (header.size(), header.is_allocated())
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::os_mem::{map_pages, unmap_pages};
     use super::*;
+    use crate::os_mem::{map_pages, unmap_pages};
 
     #[test]
     fn test_block_header() {

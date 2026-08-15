@@ -50,10 +50,19 @@ mod tests {
 
             // read and verify
             assert_eq!(*addr.add(0), 42, "First memory location must have value 42");
-            assert_eq!(*addr.add(1), 50, "Second memory location must have value 50");
+            assert_eq!(
+                *addr.add(1),
+                50,
+                "Second memory location must have value 50"
+            );
             let page_size = page_size();
             for index in 2..page_size {
-                assert_eq!(*addr.add(index), 0, "Memory location {} must be untouched with value 0", index);
+                assert_eq!(
+                    *addr.add(index),
+                    0,
+                    "Memory location {} must be untouched with value 0",
+                    index
+                );
             }
         }
     }
@@ -98,13 +107,22 @@ mod tests {
             *addr.add(0) = 42;
             assert_eq!(*addr.add(0), 42, "First memory location must have value 42");
             *addr.add(2 * page_size()) = 41;
-            assert_eq!(*addr.add(2 * page_size()), 41, "Memory location {} must have value 41", 2 * page_size());
+            assert_eq!(
+                *addr.add(2 * page_size()),
+                41,
+                "Memory location {} must have value 41",
+                2 * page_size()
+            );
             *addr.add(3 * page_size()) = 40;
-            assert_eq!(*addr.add(3 * page_size()), 40, "Memory location {} must have value 40", 3 * page_size());
+            assert_eq!(
+                *addr.add(3 * page_size()),
+                40,
+                "Memory location {} must have value 40",
+                3 * page_size()
+            );
 
             unmap_pages(addr, 1).expect("cleanup page 0 failed"); // clean page 0 alone
             unmap_pages(addr.add(2 * page_size()), 2).expect("cleanup pages 2-3 failed"); // clean pages 2,3 together
         }
     }
 }
-
