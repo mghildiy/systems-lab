@@ -5,3 +5,4 @@ mod allocator;
 pub mod block;
 pub mod os_mem;
 mod region;
+mod errors;

@@ -1,3 +1,5 @@
+use crate::errors::AllocError;
+use crate::errors::AllocError::{OutOfMemory, ZeroSizeRequest};
 use crate::region::request_block;
 
 pub struct Allocator {
@@ -11,10 +13,18 @@ impl Allocator {
             first_region: std::ptr::null_mut()
         }
     }
-    pub unsafe fn malloc(&mut self, size: usize) -> Option<*mut u8> {
-        let (region_addr, block_addr) = unsafe { request_block(self.first_region, size)? };
-        self.first_region = region_addr;
-        Some(block_addr)
+    pub unsafe fn malloc(&mut self, size: usize) -> Result<*mut u8, AllocError> {
+        if size == 0 {
+            return Err(ZeroSizeRequest);
+        }
+
+        match unsafe { request_block(self.first_region, size) } {
+            Ok((region_addr, block_addr)) => {
+                self.first_region = region_addr;
+                Ok(block_addr)
+            }
+            Err(error) => Err(error),
+        }
     }
 }
 
@@ -25,6 +35,19 @@ mod tests {
     use crate::os_mem::page_size;
     use crate::region::{has_next_region, region_header_size};
     use super::*;
+
+    #[test]
+    fn zero_malloc() {
+        unsafe {
+            let mut allocator = Allocator::new();
+            let result = allocator.malloc(0);
+
+            match result {
+                Err(ZeroSizeRequest) => (),
+                _ => assert!(false)
+            }
+        }
+    }
 
     #[test]
     fn single_malloc() {

@@ -1,4 +1,7 @@
+use std::io::ErrorKind;
 use crate::block::{block_header_size, read_header, total_block_size, write_header};
+use crate::errors::AllocError;
+use crate::errors::AllocError::{OsError, OutOfMemory, RegionAllocationFailed};
 use crate::os_mem::{map_pages, page_size};
 
 struct RegionHeader {
@@ -24,9 +27,17 @@ impl RegionHeader {
                 if self.next_region.is_null() {
                     let total_needed = size_of::<RegionHeader>() + total_size;
                     let num_pages = (total_needed + page_size() - 1) / page_size();
-                    let region_header = unsafe { create_region(num_pages)? } as *mut RegionHeader;
-                    self.next_region = region_header;
-                    unsafe { (*region_header).get_block(requested_size) }
+                    match unsafe { create_region(num_pages) } {
+                        Ok(region_addr) => {
+                            let region_header = region_addr as *mut RegionHeader;
+                            self.next_region = region_header;
+                            unsafe { (*region_header).get_block(requested_size) }
+                        }
+                        Err(e) => {
+                            eprintln!("Failed to create region header: {}", e);
+                            None
+                        }
+                    }
                 } else {
                     unsafe { (&mut *self.next_region).get_block(requested_size) }
                 }
@@ -60,12 +71,21 @@ impl RegionHeader {
     }
 }
 
-pub(crate) unsafe fn create_region(num_pages: usize) -> Option<*mut u8> {
-    let addr = unsafe { map_pages(num_pages)? };
-    let region_header = RegionHeader::new(addr, num_pages * page_size());
-    let region_header_ptr = addr as *mut RegionHeader;
-    unsafe { region_header_ptr.write(region_header) };
-    Some(addr)
+pub(crate) unsafe fn create_region(num_pages: usize) -> Result<*mut u8, AllocError> {
+    match unsafe { map_pages(num_pages) } {
+        Ok(addr) => {
+            let region_header = RegionHeader::new(addr, num_pages * page_size());
+            let region_header_ptr = addr as *mut RegionHeader;
+            unsafe { region_header_ptr.write(region_header) };
+            Ok(addr)
+        }
+        Err(io_error) => {
+            match io_error.kind() {
+                ErrorKind::OutOfMemory => Err(OutOfMemory),
+                _ => Err(OsError(io_error))
+            }
+        }
+    }
 }
 
 pub(crate) fn region_header_size() -> usize {
@@ -79,22 +99,35 @@ pub(crate) fn has_next_region(region_addr: *const u8) -> bool {
 
 // TODO take care of negative usize
 pub(crate) unsafe fn request_block(region_addr: *mut u8, block_size: usize) ->
-        Option<(*mut u8, *mut u8)> {
+        Result<(*mut u8, *mut u8), AllocError> {
     if region_addr.is_null() {
         // ask for pages just enough for this request
         let total_size = total_block_size(block_size);
         let total_needed = size_of::<RegionHeader>() + total_size;
         let num_pages = (total_needed + page_size() - 1) / page_size();
-        let region_addr = unsafe { create_region(num_pages)? };
-        let region = unsafe { &mut *(region_addr as *mut RegionHeader) };
-        let block_header_addr = unsafe { region.get_block(block_size)? };
-        let payload_addr = unsafe { block_header_addr.add(block_header_size()) };
-        Some((region_addr, payload_addr))
+        match unsafe { create_region(num_pages) } {
+            Ok(region_addr) => {
+                handle_region_addr(region_addr, block_size)
+            }
+            Err(alloc_error) => {
+                Err(alloc_error)
+            }
+        }
     } else {
-        let region = unsafe { &mut *(region_addr as *mut RegionHeader) };
-        let block_header_addr = unsafe { region.get_block(block_size)? };
-        let payload_addr = unsafe { block_header_addr.add(block_header_size()) };
-        Some((region_addr, payload_addr))
+        handle_region_addr(region_addr, block_size)
+    }
+}
+
+fn handle_region_addr(region_addr: *mut u8, block_size: usize) -> Result<(*mut u8, *mut u8), AllocError> {
+    let region = unsafe { &mut *(region_addr as *mut RegionHeader) };
+    match unsafe { region.get_block(block_size) } {
+        None => {
+            Err(RegionAllocationFailed)
+        }
+        Some(block_header_addr) => {
+            let payload_addr = unsafe { block_header_addr.add(block_header_size()) };
+            Ok((region_addr, payload_addr))
+        }
     }
 }
 

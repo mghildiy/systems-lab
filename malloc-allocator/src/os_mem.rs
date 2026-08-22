@@ -6,7 +6,7 @@ static PAGE_SIZE: OnceLock<usize> = OnceLock::new();
 pub(crate) fn page_size() -> usize {
     *PAGE_SIZE.get_or_init(|| unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize })
 }
-pub(crate) unsafe fn map_pages(num_pages: usize) -> Option<*mut u8> {
+pub(crate) unsafe fn map_pages(num_pages: usize) -> Result<*mut u8, std::io::Error> {
     let memory_size = num_pages * page_size();
     unsafe {
         let addr = libc::mmap(
@@ -19,9 +19,9 @@ pub(crate) unsafe fn map_pages(num_pages: usize) -> Option<*mut u8> {
         );
 
         if addr == libc::MAP_FAILED {
-            return None;
+            return Err(std::io::Error::last_os_error());
         }
-        Some(addr as *mut u8)
+        Ok(addr as *mut u8)
     }
 }
 pub(crate) unsafe fn unmap_pages(addr: *mut u8, num_pages: usize) -> Result<(), std::io::Error> {
