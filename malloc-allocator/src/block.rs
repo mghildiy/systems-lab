@@ -1,4 +1,5 @@
 const ALLOC_FLAG_MASK: usize = 1;
+const ALIGNMENT: usize = size_of::<usize>();
 
 struct BlockHeader {
     packed: usize,
@@ -37,6 +38,19 @@ pub(crate) unsafe fn read_header(addr: *mut u8) -> (usize, bool) {
     let header_addr = addr as *mut BlockHeader;
     let header = unsafe { &*header_addr };
     (header.size(), header.is_allocated())
+}
+
+pub(crate) fn block_header_size() -> usize {
+    size_of::<BlockHeader>()
+}
+
+pub(crate) fn total_block_size(raw_size: usize) -> usize {
+    let with_header = raw_size + size_of::<BlockHeader>();
+    round_up_to_alignment(with_header)
+}
+
+fn round_up_to_alignment(n: usize) -> usize {
+    (n + ALIGNMENT - 1) & !(ALIGNMENT - 1)
 }
 
 #[cfg(test)]

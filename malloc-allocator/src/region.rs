@@ -1,4 +1,4 @@
-use crate::block::{read_header, write_header};
+use crate::block::{block_header_size, read_header, total_block_size, write_header};
 use crate::os_mem::{map_pages, page_size};
 
 struct RegionHeader {
@@ -16,38 +16,45 @@ impl RegionHeader {
         }
     }
 
-    unsafe fn get_block(&mut self, requested_size: usize) -> *mut u8 {
-        match self.walk_blocks(requested_size) {
+    unsafe fn get_block(&mut self, requested_size: usize) -> Option<*mut u8> {
+        let total_size = total_block_size(requested_size);
+        match unsafe { self.walk_blocks(total_size) } {
             None => {
-                return if !self.next_region.is_null() {
-                    self.next_region.get_block(requested_size)
+                // create next region, and get block from it
+                if self.next_region.is_null() {
+                    let total_needed = size_of::<RegionHeader>() + total_size;
+                    let num_pages = (total_needed + page_size() - 1) / page_size();
+                    let region_header = unsafe { create_region(num_pages)? } as *mut RegionHeader;
+                    self.next_region = region_header;
+                    unsafe { (*region_header).get_block(requested_size) }
                 } else {
-                    *map_pages(2).get_or_insert(std::ptr::null_mut())
-                };
+                    unsafe { (&mut *self.next_region).get_block(requested_size) }
+                }
             }
-            Some(addr) => addr,
+            Some(addr) => Some (addr),
         }
     }
 
     unsafe fn walk_blocks(&mut self, size: usize) -> Option<*mut u8> {
         let region_header_addr = std::ptr::from_mut(self) as *mut u8;
         let mut block_header_addr = unsafe { region_header_addr.add(size_of::<RegionHeader>()) };
-        let mut bytes_so_far = 0;
         while block_header_addr != self.frontier {
             let (block_size, is_allocated) = unsafe { read_header(block_header_addr) };
-            bytes_so_far += block_size;
             if !is_allocated && block_size >= size {
                 unsafe { write_header(block_header_addr, block_size, true) };
                 return Some(block_header_addr);
             }
             block_header_addr = unsafe { block_header_addr.add(block_size) };
         }
-        let region_header_end_addr = region_header_addr.add(self.size);
+        let region_header_end_addr = unsafe { region_header_addr.add(self.size) };
         let remaining_space = region_header_end_addr as usize - self.frontier as usize;
         if remaining_space >= size {
-            unsafe { write_header(self.frontier, size, true) };
+            let new_block_addr = self.frontier;
+            // write block header
+            unsafe { write_header(new_block_addr, size, true) };
+            // advance frontier
             self.frontier = unsafe { self.frontier.add(size) };
-            return Some(self.frontier);
+            return Some(new_block_addr);
         }
         None
     }
@@ -61,10 +68,34 @@ pub(crate) unsafe fn create_region(num_pages: usize) -> Option<*mut u8> {
     Some(addr)
 }
 
+pub(crate) fn region_header_size() -> usize {
+    size_of::<RegionHeader>()
+}
+
+pub(crate) fn has_next_region(region_addr: *const u8) -> bool {
+    let region_header = region_addr as *const RegionHeader;
+    unsafe { !(*region_header).next_region.is_null() }
+}
+
 // TODO take care of negative usize
-pub(crate) unsafe fn request_block(region_addr: *mut u8, block_size: usize) -> *mut u8 {
-    let region = &mut *(region_addr as *mut RegionHeader);
-    region.get_block(block_size)
+pub(crate) unsafe fn request_block(region_addr: *mut u8, block_size: usize) ->
+        Option<(*mut u8, *mut u8)> {
+    if region_addr.is_null() {
+        // ask for pages just enough for this request
+        let total_size = total_block_size(block_size);
+        let total_needed = size_of::<RegionHeader>() + total_size;
+        let num_pages = (total_needed + page_size() - 1) / page_size();
+        let region_addr = unsafe { create_region(num_pages)? };
+        let region = unsafe { &mut *(region_addr as *mut RegionHeader) };
+        let block_header_addr = unsafe { region.get_block(block_size)? };
+        let payload_addr = unsafe { block_header_addr.add(block_header_size()) };
+        Some((region_addr, payload_addr))
+    } else {
+        let region = unsafe { &mut *(region_addr as *mut RegionHeader) };
+        let block_header_addr = unsafe { region.get_block(block_size)? };
+        let payload_addr = unsafe { block_header_addr.add(block_header_size()) };
+        Some((region_addr, payload_addr))
+    }
 }
 
 #[cfg(test)]
