@@ -2,17 +2,25 @@ use crate::errors::AllocError;
 use crate::errors::AllocError::{OutOfMemory, ZeroSizeRequest};
 use crate::region::request_block;
 
+
+/// A simple malloc-style memory allocator, backed by mmap'd regions
+/// managed as a linked chain, each holding an implicit list of blocks.
 pub struct Allocator {
     first_region: *mut u8,
 }
 
 impl Allocator {
 
+    /// Creates a new, empty allocator. No memory is requested from the OS
+    /// until the first `malloc` call (lazy initialization).
     pub fn new() -> Allocator {
         Allocator {
             first_region: std::ptr::null_mut()
         }
     }
+
+    /// Allocates at least `size` usable bytes, returning a pointer to them.
+    /// Returns an error if `size` is zero or if memory could not be obtained.
     pub unsafe fn malloc(&mut self, size: usize) -> Result<*mut u8, AllocError> {
         if size == 0 {
             return Err(ZeroSizeRequest);

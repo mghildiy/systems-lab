@@ -3,9 +3,15 @@ use std::ptr;
 use std::sync::OnceLock;
 
 static PAGE_SIZE: OnceLock<usize> = OnceLock::new();
+
+/// Returns the OS page size in bytes, queried once via `sysconf` and cached
+/// for all subsequent calls (page size never changes during a process's lifetime).
 pub(crate) fn page_size() -> usize {
     *PAGE_SIZE.get_or_init(|| unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize })
 }
+
+/// Requests `num_pages` fresh, zero-initialized pages from the OS via `mmap`.
+/// Returns the starting address on success, or the underlying OS error on failure.
 pub(crate) unsafe fn map_pages(num_pages: usize) -> Result<*mut u8, std::io::Error> {
     let memory_size = num_pages * page_size();
     unsafe {
@@ -24,6 +30,10 @@ pub(crate) unsafe fn map_pages(num_pages: usize) -> Result<*mut u8, std::io::Err
         Ok(addr as *mut u8)
     }
 }
+
+/// Releases `num_pages` pages starting at `addr` back to the OS via `munmap`.
+/// `addr` must be exactly a value previously returned by `map_pages`, and
+/// `num_pages` must match what was originally requested for that mapping.
 pub(crate) unsafe fn unmap_pages(addr: *mut u8, num_pages: usize) -> Result<(), std::io::Error> {
     unsafe {
         let result = libc::munmap(addr as *mut c_void, num_pages * page_size());

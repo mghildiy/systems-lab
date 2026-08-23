@@ -1,6 +1,8 @@
 use std::fmt;
 use std::fmt::Display;
 
+
+/// Errors that can occur while allocating memory.
 #[derive(Debug)]
 pub enum AllocError {
     ZeroSizeRequest,
