@@ -1,0 +1,6 @@
+[workspace]
+resolver = "3"
+members = [ "cypherlabs-rs/postgresmanager","malloc-allocator"]
+
+[workspace.package]
+edition = "2024"

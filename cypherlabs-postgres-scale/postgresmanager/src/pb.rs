@@ -1,0 +1,1 @@
+tonic::include_proto!("cypherlabs.postgres.scale.postgresmanager");

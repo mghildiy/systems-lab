@@ -1,0 +1,16 @@
+syntax = "proto3";
+
+package cypherlabs.postgres.scale.postgresmanager;
+
+service PostgresManager {
+    rpc StartPrimary (StartPrimaryRequest) returns (StartPrimaryResponse);
+}
+
+message StartPrimaryRequest {
+    string data_dir = 1;
+    uint32 port = 2;
+}
+
+message StartPrimaryResponse {
+    uint32 pid = 1;
+}

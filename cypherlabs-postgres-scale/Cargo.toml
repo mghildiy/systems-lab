@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["malloc-allocator"]
+members = ["postgresmanager"]
 
 [workspace.package]
 edition = "2024"
