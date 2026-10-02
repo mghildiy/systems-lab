@@ -44,8 +44,18 @@ impl PostgresManager for PostgresManagerService {
             }
         }
 
+        // TODO(v0 gap): if a postgres instance is already running against this data_dir
+        // (detectable via postmaster.pid's pid still being alive), StartPrimary currently
+        // has no check for this and will attempt to spawn a second postgres, which will
+        // fail due to port/lock conflicts — but since postgres's spawn() succeeding doesn't
+        // mean it stayed running, the current code would still report a false-positive
+        // success (returning a pid for a process that immediately exited).
+        // Decision deferred: should a call against an already-running instance be (a) an
+        // error (FAILED_PRECONDITION/ALREADY_EXISTS), or (b) idempotent success (return the
+        // existing pid without spawning)? Revisit when Operator's real retry semantics are known.
+
         let mut postgres_command = Command::new("postgres");
-        let mut postgres_process = postgres_command
+        let postgres_process = postgres_command
             .arg("-D")
             .arg(data_dir)
             .arg("-p")
