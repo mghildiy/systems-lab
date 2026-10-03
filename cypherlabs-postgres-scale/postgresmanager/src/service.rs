@@ -4,7 +4,7 @@ use tokio::process::Command;
 use tokio::sync::Mutex;
 use tonic::{async_trait, Request, Response, Status};
 use crate::pb::postgres_manager_server::PostgresManager;
-use crate::pb::{CreateReplicationSlotRequest, CreateReplicationSlotResponse, StartPrimaryRequest, StartPrimaryResponse};
+use crate::pb::{CreateReplicationSlotRequest, CreateReplicationSlotResponse, StartPrimaryRequest, StartPrimaryResponse, StartReplicaRequest, StartReplicaResponse};
 
 pub(crate) struct PostgresManagerService {
     postgres_port: Arc<Mutex<Option<u32>>>
@@ -23,7 +23,7 @@ impl PostgresManagerService {
 impl PostgresManager for PostgresManagerService {
 
     async fn start_primary(&self, request: Request<StartPrimaryRequest>)
-        -> Result<Response<StartPrimaryResponse>, Status> {
+            -> Result<Response<StartPrimaryResponse>, Status> {
         let start_primary_request = request.get_ref();
         let data_dir = &start_primary_request.data_dir;
         let port = start_primary_request.port;
@@ -78,7 +78,7 @@ impl PostgresManager for PostgresManagerService {
     }
 
     async fn create_replication_slot(&self, request: Request<CreateReplicationSlotRequest>)
-        -> Result<Response<CreateReplicationSlotResponse>, Status> {
+            -> Result<Response<CreateReplicationSlotResponse>, Status> {
         let create_replication_slot_request = request.get_ref();
         let guard = self.postgres_port.lock().await;
         let port = match *guard {
@@ -124,6 +124,17 @@ impl PostgresManager for PostgresManagerService {
         let lsn = row.get("lsn");
 
         Ok(Response::new(crate::pb::CreateReplicationSlotResponse { lsn }))
+    }
+
+    async fn start_replica(&self, request: Request<StartReplicaRequest>)
+            -> Result<Response<StartReplicaResponse>, Status> {
+        let request = request.get_ref();
+        let data_dir = &request.data_dir;
+        let port = request.port;
+        let primary_host = request.primary_host;
+        let primary_port = request.primary_port;
+        let slot_name = request.slot_name;
+
     }
 }
 
