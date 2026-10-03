@@ -1,16 +1,21 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tokio::process::Command;
+use tokio::sync::Mutex;
 use tonic::{async_trait, Request, Response, Status};
-use tonic::codegen::Service;
-use tonic::server::NamedService;
 use crate::pb::postgres_manager_server::PostgresManager;
-use crate::pb::{StartPrimaryRequest, StartPrimaryResponse};
+use crate::pb::{CreateReplicationSlotRequest, CreateReplicationSlotResponse, StartPrimaryRequest, StartPrimaryResponse};
 
-pub(crate) struct PostgresManagerService;
+pub(crate) struct PostgresManagerService {
+    postgres_port: Arc<Mutex<Option<u32>>>
+}
 
 impl PostgresManagerService {
     pub(crate) fn new() -> Self {
-        PostgresManagerService
+        let postgres_port = Arc::new(Mutex::new(None));
+        PostgresManagerService {
+            postgres_port
+        }
     }
 }
 
@@ -68,9 +73,65 @@ impl PostgresManager for PostgresManagerService {
             None => return Err(Status::internal("postgres pid not available")),
         };
 
-
+        *self.postgres_port.lock().await = Some(port);
         Ok(Response::new(StartPrimaryResponse { pid }))
     }
+
+    async fn create_replication_slot(&self, request: Request<CreateReplicationSlotRequest>)
+        -> Result<Response<CreateReplicationSlotResponse>, Status> {
+        let create_replication_slot_request = request.get_ref();
+        let guard = self.postgres_port.lock().await;
+        let port = match *guard {
+            Some(port) => port,
+            None => return Err(Status::failed_precondition("Primary is not running; call StartPrimary first")),
+        };
+        drop(guard);
+
+        let slot_name = &create_replication_slot_request.slot_name;
+
+        let usr = std::env::var("USER").unwrap_or_default();
+        let db_connection_string = postgres_connection_string(&usr, "",
+         "localhost", port, "postgres");
+
+        let (client, connection) = tokio_postgres::connect(&db_connection_string, tokio_postgres::NoTls)
+            .await
+            .map_err(|e| {
+                eprintln!("{}", e);
+                Status::internal("Failed to connect to Postgres")
+            })?;
+
+        tokio::spawn(async move {
+            if let Err(e) = connection.await {
+                eprintln!("Connection error: {}", e);
+            }
+        });
+
+        // TODO(v0 gap): CreateReplicationSlot currently errors if a slot with this name
+        // already exists (Postgres itself rejects the duplicate create). No idempotency
+        // check is performed first (e.g., SELECT 1 FROM pg_replication_slots WHERE slot_name = $1).
+        // Decision deferred, same as StartPrimary's analogous gap: should a repeat call
+        // against an existing slot be (a) an error (current behavior, acceptable short-term),
+        // or (b) idempotent success (detect existing slot, return its current LSN without
+        // attempting to recreate)? Revisit once Operator's real retry semantics are known.
+
+        let row = client
+            .query_one("SELECT lsn::text FROM pg_create_physical_replication_slot($1, true)", &[&slot_name])
+            .await
+            .map_err(|e| {
+                eprintln!("{}", e);
+                Status::internal("Failed to create replication slot")
+            })?;
+        let lsn = row.get("lsn");
+
+        Ok(Response::new(crate::pb::CreateReplicationSlotResponse { lsn }))
+    }
+}
+
+fn postgres_connection_string(user: &str, password: &str, host: &str, port: u32, database: &str) -> String {
+    format!(
+        "postgresql://{}:{}@{}:{}/{}",
+        user, password, host, port, database
+    )
 }
 
 // helper function, private to this file, no `pub`

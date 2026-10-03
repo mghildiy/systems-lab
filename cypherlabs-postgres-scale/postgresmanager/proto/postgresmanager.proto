@@ -4,6 +4,7 @@ package cypherlabs.postgres.scale.postgresmanager;
 
 service PostgresManager {
     rpc StartPrimary (StartPrimaryRequest) returns (StartPrimaryResponse);
+    rpc CreateReplicationSlot (CreateReplicationSlotRequest) returns (CreateReplicationSlotResponse);
 }
 
 message StartPrimaryRequest {
@@ -13,4 +14,12 @@ message StartPrimaryRequest {
 
 message StartPrimaryResponse {
     uint32 pid = 1;
+}
+
+message CreateReplicationSlotRequest {
+    string slot_name = 1;
+}
+
+message CreateReplicationSlotResponse {
+    string lsn = 1;
 }
