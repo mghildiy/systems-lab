@@ -45,7 +45,7 @@ impl PostgresManager for PostgresManagerService {
                 .map_err(|e| to_internal_status("START_PRIMARY_INITDB_EXECUTION", e))?;
             if !exitstatus.success() {
                 return Err(Status::internal(format!("DB initialization failed with error {}",
-                                                    exitstatus.to_string())));
+                                                    exitstatus)));
             }
         }
 
@@ -131,10 +131,63 @@ impl PostgresManager for PostgresManagerService {
         let request = request.get_ref();
         let data_dir = &request.data_dir;
         let port = request.port;
-        let primary_host = request.primary_host;
+        let primary_host = &request.primary_host;
         let primary_port = request.primary_port;
-        let slot_name = request.slot_name;
+        let slot_name = &request.slot_name;
+        let usr = std::env::var("USER").unwrap_or_default();
 
+        let mut pg_basebackup_command = Command::new("pg_basebackup");
+        let mut pg_basebackup_process = pg_basebackup_command
+            .arg("-D")
+            .arg(&data_dir)
+            .arg("-h")
+            .arg(primary_host)
+            .arg("-p")
+            .arg(primary_port.to_string())
+            .arg("-U")
+            .arg(usr)
+            .arg("-S")
+            .arg(slot_name)
+            .arg("-R")
+            .arg("-X")
+            .arg("stream")
+            .spawn()
+            .map_err(|e| to_internal_status("START_REPLICA_BASEBACKUP_SPAWN", e))?;
+
+        let exit_status = pg_basebackup_process
+            .wait().await
+            .map_err(|e| to_internal_status("START_REPLICA_BASEBACKUP_EXECUTION", e))?;
+
+        if !exit_status.success() {
+            return Err(Status::internal(format!("pg_basebackup failed with status: {}", exit_status)));
+        }
+
+        // TODO(v0 gap): if a postgres instance is already running against this data_dir
+        // (detectable via postmaster.pid's pid still being alive), StartPrimary currently
+        // has no check for this and will attempt to spawn a second postgres, which will
+        // fail due to port/lock conflicts — but since postgres's spawn() succeeding doesn't
+        // mean it stayed running, the current code would still report a false-positive
+        // success (returning a pid for a process that immediately exited).
+        // Decision deferred: should a call against an already-running instance be (a) an
+        // error (FAILED_PRECONDITION/ALREADY_EXISTS), or (b) idempotent success (return the
+        // existing pid without spawning)? Revisit when Operator's real retry semantics are known.
+
+        let mut postgres_command = Command::new("postgres");
+        let postgres_process = postgres_command
+            .arg("-D")
+            .arg(data_dir)
+            .arg("-p")
+            .arg(port.to_string())
+            .spawn()
+            .map_err(|e| to_internal_status("START_REPLICA_POSTGRES_SPAWN", e))?;
+
+        let pid = match postgres_process.id() {
+            Some(pid) => pid,
+            None => return Err(Status::internal("postgres pid not available")),
+        };
+
+        *self.postgres_port.lock().await = Some(port);
+        Ok(Response::new(StartReplicaResponse { pid }))
     }
 }
 
