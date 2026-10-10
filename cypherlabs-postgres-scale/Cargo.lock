@@ -708,6 +708,7 @@ name = "postgresmanager"
 version = "0.1.0"
 dependencies = [
  "prost",
+ "tempfile",
  "tokio",
  "tokio-postgres",
  "tonic",
