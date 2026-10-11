@@ -3,7 +3,7 @@ mod pb {
 }
 
 use tempfile::tempdir;
-use tokio_postgres::{Client, Row};
+use tokio_postgres::{Client, Error, Row};
 use tokio_postgres::types::ToSql;
 use pb::postgres_manager_client::PostgresManagerClient;
 use pb::{CreateReplicationSlotRequest, StartPrimaryRequest};
@@ -221,6 +221,16 @@ async fn test_end_to_end_replication() {
                                         &[], "CHECK_REPLICA_DATA").await;
     let actual_note: String = replica_data_record.get(0);
     assert_eq!(actual_note, "before replica", "note column value not as expected");
+
+    let inserted_rows_count: u64 = run_command(&primary_postgres_client,
+                                               "INSERT INTO test_table VALUES (2, 'after replica')",
+                                               &[], "INSERT_DATA_IN_TABLE_IN_PRIMARY").await;
+    assert_eq!(inserted_rows_count, 1, "Wrong number of rows inserted in table");
+
+    let replica_data_record = run_query_for_timeperiod(&replica_postgres_client, "SELECT note FROM test_table WHERE id = 2",
+                             &[], "CHECK_REPLICA_DATA").await;
+    let actual_note: String = replica_data_record.get(0);
+    assert_eq!(actual_note, "after replica", "note column value not as expected");
 }
 
 async fn run_query(client: &Client, query: &str, params: &[&(dyn ToSql + Sync)], context: &str)
@@ -228,7 +238,7 @@ async fn run_query(client: &Client, query: &str, params: &[&(dyn ToSql + Sync)],
     match client
         .query_one(query, params)
         .await {
-        Ok(row) => return row,
+        Ok(row) => row,
         Err(e) => {
             panic!("failed to execute query {}, error: {}, message: {}", query, e, context);
         }
@@ -243,6 +253,26 @@ async fn run_command(client: &Client, command: &str, params: &[&(dyn ToSql + Syn
         Ok(num) => num,
         Err(e) => {
             panic!("failed to execute command {}, error: {}, message: {}", command, e, context);
+        }
+    }
+}
+
+async fn run_query_for_timeperiod(client: &Client, query: &str, params: &[&(dyn ToSql + Sync)],
+                                context: &str) -> Row {
+    let start_time = std::time::Instant::now();
+    let timeout = 5;
+    loop {
+        match client.query_opt(query, params).await {
+            Ok(Some(row)) => return row,
+            Ok(None) if std::time::Instant::now() >= start_time + std::time::Duration::from_secs(timeout)=> {
+                panic!("No data found in replica after {} seconds", timeout);
+            },
+            Err(e) if std::time::Instant::now() >= start_time + std::time::Duration::from_secs(5)  => {
+                panic!("failed to execute query {}, error: {}, message: {}", query, e, context);
+            },
+            _ => {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
         }
     }
 }
