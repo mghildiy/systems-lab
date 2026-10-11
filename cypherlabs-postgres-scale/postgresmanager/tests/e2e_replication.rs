@@ -3,6 +3,8 @@ mod pb {
 }
 
 use tempfile::tempdir;
+use tokio_postgres::{Client, Row};
+use tokio_postgres::types::ToSql;
 use pb::postgres_manager_client::PostgresManagerClient;
 use pb::{CreateReplicationSlotRequest, StartPrimaryRequest};
 use crate::pb::StartReplicaRequest;
@@ -145,14 +147,14 @@ async fn test_end_to_end_replication() {
     let usr = std::env::var("USER").unwrap_or_default();
     let primary_connection_string = postgres_connection_string(&usr, "", "127.0.0.1",
                                                           primary_port.into(), "postgres");
-    let postgres_client= postgres_connect_with_retry(&primary_connection_string)
+    let primary_postgres_client= postgres_connect_with_retry(&primary_connection_string)
         .await
         .expect("failed to connect to primary");
-    let table_count = postgres_client
+    let table_count = primary_postgres_client
         .execute("CREATE TABLE test_table (id int, note text)", &[])
         .await
         .expect("failed to create table");
-    let inserted_rows_count  = postgres_client
+    let inserted_rows_count  = primary_postgres_client
         .execute("INSERT INTO test_table VALUES (1, 'before replica')", &[])
         .await
         .expect("failed to insert data");
@@ -174,11 +176,11 @@ async fn test_end_to_end_replication() {
     let lo = u64::from_str_radix(lsn_parts[1], 16).expect("bad lo in LSN");
     let lsn_value = (hi << 32) | lo;
     assert!(lsn_value > 0, "LSN should be a real WAL position");
-    let restart_lsn = postgres_client
-        .query_one("SELECT restart_lsn::text FROM pg_replication_slots WHERE slot_name = $1", &[&slot_name])
-        .await
-        .expect("replication slot query failed");
-    let stored_lsn: String = restart_lsn.get(0);
+
+    let lsn_primary_query = "SELECT restart_lsn::text FROM pg_replication_slots WHERE slot_name = $1";
+    let replication_slot_lsn_record = run_query(&primary_postgres_client, lsn_primary_query,
+                                 &[&slot_name], "GET_REPLICATION_SLOT_LSN").await;
+    let stored_lsn: String = replication_slot_lsn_record.get(0);
     assert_eq!(&stored_lsn, lsn, "LSN mismatch");
 
     // launch replica
@@ -207,7 +209,31 @@ async fn test_end_to_end_replication() {
         .expect("failed to start replica");
     let replica_connection_string = postgres_connection_string(&usr, "", "127.0.0.1",
                                                                replica_port.into(), "postgres");
-    let postgres_client= postgres_connect_with_retry(&replica_connection_string)
+    let replica_postgres_client= postgres_connect_with_retry(&replica_connection_string)
         .await
         .expect("failed to connect to replica");
+
+    let replica_recovery_status_record = run_query(&replica_postgres_client,
+                                            "SELECT pg_is_in_recovery()", &[],
+                                            "CHECK_REPLICA_RECOVERY_STATUS").await;
+    let is_recovery_mode_on: bool = replica_recovery_status_record.get(0);
+    assert!(is_recovery_mode_on, "Recovery mode for replica must be TRUE");
+
+    let replica_data_record = run_query(&replica_postgres_client,
+                                        "SELECT note FROM test_table WHERE id = 1",
+                                        &[], "CHECK_REPLICA_DATA").await;
+    let actual_note: String = replica_data_record.get(0);
+    assert_eq!(actual_note, "before replica", "note column value not as expected");
+}
+
+async fn run_query(client: &Client, query: &str, params: &[&(dyn ToSql + Sync)],context: &str)
+        -> Row {
+    match client
+        .query_one(query, params)
+        .await {
+        Ok(row) => return row,
+        Err(e) => {
+            panic!("failed to execute query {}, error: {}, message: {}", query, e, context);
+        }
+    }
 }
