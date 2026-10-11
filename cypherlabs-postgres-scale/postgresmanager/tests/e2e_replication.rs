@@ -2,27 +2,30 @@ mod pb {
     tonic::include_proto!("cypherlabs.postgres.scale.postgresmanager");
 }
 
-use tempfile::{tempdir, tempfile};
+use tempfile::tempdir;
 use pb::postgres_manager_client::PostgresManagerClient;
 use pb::{CreateReplicationSlotRequest, StartPrimaryRequest};
+use crate::pb::StartReplicaRequest;
 
 struct TestEnv {
     server_process: tokio::process::Child,
     data_dir: String,
     temp_dir: tempfile::TempDir,
+    replica_data_dir: Option<String>,
+    replica_temp_dir: Option<tempfile::TempDir>
 }
 
 impl Drop for TestEnv {
     fn drop(&mut self) {
+        if let Some(dir) = &self.replica_data_dir {
+            terminate_postgres(dir);
+        }
         terminate_postgres(&self.data_dir);
         let _ = self.server_process.start_kill();
     }
 }
 
 async fn start_server() -> (tokio::process::Child, u16) {
-    //let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    //let port = listener.local_addr().unwrap().port();
-    //drop(listener);
     let port = free_port();
     println!("Assigned LISTEN_PORT: {}", port);
     let binary_path = env!("CARGO_BIN_EXE_postgresmanager");
@@ -36,7 +39,6 @@ async fn start_server() -> (tokio::process::Child, u16) {
 async fn postgresmanager_connect_with_retry(addr: &str) -> Result<PostgresManagerClient<tonic::transport::Channel>,
         tonic::transport::Error> {
     let max_retries = 20;
-    //let mut last_error = None;
     let mut attempts = 0;
     loop {
         match PostgresManagerClient::connect(addr.to_string()).await {
@@ -49,23 +51,11 @@ async fn postgresmanager_connect_with_retry(addr: &str) -> Result<PostgresManage
             }
         }
     }
-    /*for _ in 0..max_retries {
-        match PostgresManagerClient::connect(addr.to_string()).await {
-            Ok(client) => return Ok(client),
-            Err(e) => {
-                last_error = Some(e);
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            },
-        }
-    }
-
-    panic!("Failed to connect to gRPC server after {} attempts: {:?}", max_retries, last_error);*/
 }
 
 async fn postgres_connect_with_retry(conn_string: &str) -> Result<tokio_postgres::Client, tokio_postgres::Error> {
     let max_attempts = 20;
     let mut attempts = 0;
-    //let mut last_error = None;
     loop {
         match tokio_postgres::connect(conn_string, tokio_postgres::NoTls).await {
             Ok((client, connection)) => {
@@ -126,10 +116,12 @@ async fn test_end_to_end_replication() {
         .to_str()
         .expect("temp path is not valid UTF-8")
         .to_string();
-    let env = TestEnv {
+    let mut env = TestEnv {
         server_process,
         data_dir,
         temp_dir,
+        replica_data_dir: None,
+        replica_temp_dir: None
     };
 
     // create gRPC client
@@ -139,6 +131,7 @@ async fn test_end_to_end_replication() {
                                         .expect("failed to connect to postgres manager");
     // start primary
     let primary_port = free_port();
+    println!("Primary port: {}", primary_port);
     let start_primary_request = StartPrimaryRequest {
         data_dir: env.data_dir.clone(),
         port: primary_port.into()
@@ -150,11 +143,11 @@ async fn test_end_to_end_replication() {
 
     // insert data in primary
     let usr = std::env::var("USER").unwrap_or_default();
-    let db_connection_string = postgres_connection_string(&usr, "", "localhost",
+    let primary_connection_string = postgres_connection_string(&usr, "", "127.0.0.1",
                                                           primary_port.into(), "postgres");
-    let postgres_client= postgres_connect_with_retry(&db_connection_string)
+    let postgres_client= postgres_connect_with_retry(&primary_connection_string)
         .await
-        .expect("failed to connect to postgres");
+        .expect("failed to connect to primary");
     let table_count = postgres_client
         .execute("CREATE TABLE test_table (id int, note text)", &[])
         .await
@@ -187,4 +180,34 @@ async fn test_end_to_end_replication() {
         .expect("replication slot query failed");
     let stored_lsn: String = restart_lsn.get(0);
     assert_eq!(&stored_lsn, lsn, "LSN mismatch");
+
+    // launch replica
+    let replica_temp_dir = tempdir().expect("failed to create temp directory");
+    let replica_data_dir = replica_temp_dir
+        .path()
+        .to_str()
+        .expect("temp path is not valid UTF-8")
+        .to_string();
+    let replica_port = free_port();
+    println!("Replica port: {}", replica_port);
+    let start_replica_request = StartReplicaRequest {
+        data_dir: replica_data_dir.clone(),
+        port: replica_port.into(),
+        primary_host: "127.0.0.1".to_string(),
+        primary_port: primary_port.into(),
+        slot_name: slot_name.to_string()
+    };
+    env.replica_temp_dir = Some(replica_temp_dir);
+    env.replica_data_dir = Some(replica_data_dir);
+
+
+    let start_replica_response = postgresmanager
+        .start_replica(start_replica_request)
+        .await
+        .expect("failed to start replica");
+    let replica_connection_string = postgres_connection_string(&usr, "", "127.0.0.1",
+                                                               replica_port.into(), "postgres");
+    let postgres_client= postgres_connect_with_retry(&replica_connection_string)
+        .await
+        .expect("failed to connect to replica");
 }

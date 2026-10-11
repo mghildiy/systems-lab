@@ -1,3 +1,4 @@
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::process::Command;
@@ -153,6 +154,11 @@ impl PostgresManager for PostgresManagerService {
             .arg("stream")
             .spawn()
             .map_err(|e| to_internal_status("START_REPLICA_BASEBACKUP_SPAWN", e))?;
+
+        // restrict permissions to this user only on data dir, else pg_basebackup doesn't work
+        std::fs::set_permissions(data_dir, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| to_internal_status("START_REPLICA_PERMISSION_", e))?;
+
 
         let exit_status = pg_basebackup_process
             .wait().await
