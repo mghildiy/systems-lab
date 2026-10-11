@@ -85,18 +85,6 @@ fn postgres_connection_string(user: &str, password: &str, host: &str, port: u32,
     )
 }
 
-fn kill_process_on_port(port: u16) {
-    let output = std::process::Command::new("lsof")
-        .arg("-ti")
-        .arg(format!(":{}", port))
-        .output()
-        .unwrap();
-    let pid_str = String::from_utf8_lossy(&output.stdout);
-    for pid in pid_str.lines() {
-        let _ = std::process::Command::new("kill").arg(pid).output();
-    }
-}
-
 fn free_port() -> u16 {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     listener.local_addr().unwrap().port()
@@ -264,7 +252,7 @@ async fn run_query_for_timeperiod(client: &Client, query: &str, params: &[&(dyn 
     loop {
         match client.query_opt(query, params).await {
             Ok(Some(row)) => return row,
-            Ok(None) if std::time::Instant::now() >= start_time + std::time::Duration::from_secs(timeout)=> {
+            Ok(None) if std::time::Instant::now() >= start_time + std::time::Duration::from_secs(timeout) => {
                 panic!("No data found in replica after {} seconds", timeout);
             },
             Ok(None) => tokio::time::sleep(std::time::Duration::from_millis(100)).await,

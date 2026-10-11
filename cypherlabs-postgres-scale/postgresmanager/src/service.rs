@@ -1,7 +1,7 @@
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::process::Command;
+use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 use tonic::{async_trait, Request, Response, Status};
 use crate::pb::postgres_manager_server::PostgresManager;
@@ -31,19 +31,15 @@ impl PostgresManager for PostgresManagerService {
 
         let is_data_dir_initialized = Path::exists(PathBuf::from(data_dir).join("PG_VERSION").as_path());
         if !is_data_dir_initialized {
-            let mut initdb_command = Command::new("initdb");
-            let mut initdb_process = initdb_command
-                .arg("-D")
-                .arg(data_dir)
-                .spawn()
-                .map_err(|e| to_internal_status("START_PRIMARY_INITDB_SPAWN", e))?;
-            let pid = match initdb_process.id() {
-                Some(pid) => pid,
-                None => return Err(Status::internal("PID not set")),
+            let mut initdb_process = run_command("initdb",
+                                                 &["-D", data_dir],
+                                                 "EXECUTE_POSTGRES_INITDB_IN_PRIMNARY")?;
+            if initdb_process.id().is_none() {
+                return Err(Status::internal("PID not set"));
             };
 
             let exitstatus = initdb_process.wait().await
-                .map_err(|e| to_internal_status("START_PRIMARY_INITDB_EXECUTION", e))?;
+                .map_err(|e| to_internal_status("LAUNCH_PRIMARY_INITDB", e))?;
             if !exitstatus.success() {
                 return Err(Status::internal(format!("DB initialization failed with error {}",
                                                     exitstatus)));
@@ -60,19 +56,21 @@ impl PostgresManager for PostgresManagerService {
         // error (FAILED_PRECONDITION/ALREADY_EXISTS), or (b) idempotent success (return the
         // existing pid without spawning)? Revisit when Operator's real retry semantics are known.
 
-        let mut postgres_command = Command::new("postgres");
-        let postgres_process = postgres_command
-            .arg("-D")
-            .arg(data_dir)
-            .arg("-p")
-            .arg(port.to_string())
-            .spawn()
-            .map_err(|e| to_internal_status("START_PRIMARY_POSTGRES_SPAWN", e))?;
+        let mut postgres_process = run_command("postgres",
+                                               &["-D", data_dir, "-p", &port.to_string()],
+                                               "START_PRIMARY_POSTGRES_SPAWN")?;
 
         let pid = match postgres_process.id() {
             Some(pid) => pid,
             None => return Err(Status::internal("postgres pid not available")),
         };
+
+        // wait for postgres to be ready within a time period, else return
+        if let Err(e) = wait_until_pg_ready(&mut postgres_process, port, "TEST_READINESS_FOR_PRIMARY_PG")
+            .await {
+            let _ = postgres_process.kill().await;
+            return Err(e);
+        }
 
         *self.postgres_port.lock().await = Some(port);
         Ok(Response::new(StartPrimaryResponse { pid }))
@@ -210,3 +208,39 @@ fn to_internal_status(context: &str, e: std::io::Error) -> Status {
     Status::internal("Failure while trying to initialize data directory".to_string())
 }
 
+fn run_command(command: &str, args: &[&str], context: &str) -> Result<Child, Status> {
+    Command::new(command)
+        .args(args)
+        .spawn()
+        .map_err(|e| to_internal_status(context, e))
+}
+
+async fn wait_until_pg_ready(pg_process: &mut Child, port: u32, context: &str) -> Result<(), Status> {
+    let _ = match pg_process.try_wait() {
+        Ok(Some(status)) => {
+            eprintln!("Postgres exited with status {}", status.to_string());
+            return Err(Status::internal("Postgres exited"))
+        },
+        Ok(None) => true,
+        Err(e) => return Err(to_internal_status(context, e)),
+    };
+
+    let start_time = std::time::Instant::now();
+    let timeout = 5;
+    let args = &["-h", "127.0.0.1", "-p", &port.to_string()];
+    loop {
+        match Command::new("pg_isready")
+            .args(args)
+            .output()
+            .await {
+                Ok(output) if output.status.success() => return Ok(()),
+                Ok(_) if std::time::Instant::now() >= start_time + std::time::Duration::from_secs(timeout)
+                    => {
+                    eprintln!("Postgres failed to be ready to accept requests for {}", context);
+                    return Err(Status::failed_precondition("Postgres not ready"))
+                },
+                Ok(_) => tokio::time::sleep(std::time::Duration::from_millis(100)).await,
+                Err(e) => return Err(to_internal_status(context, e)),
+            }
+    }
+}
