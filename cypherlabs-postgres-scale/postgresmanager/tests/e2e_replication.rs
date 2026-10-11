@@ -150,14 +150,11 @@ async fn test_end_to_end_replication() {
     let primary_postgres_client= postgres_connect_with_retry(&primary_connection_string)
         .await
         .expect("failed to connect to primary");
-    let table_count = primary_postgres_client
-        .execute("CREATE TABLE test_table (id int, note text)", &[])
-        .await
-        .expect("failed to create table");
-    let inserted_rows_count  = primary_postgres_client
-        .execute("INSERT INTO test_table VALUES (1, 'before replica')", &[])
-        .await
-        .expect("failed to insert data");
+    run_command(&primary_postgres_client, "CREATE TABLE test_table (id int, note text)",
+                &[], "CREATE_TABLE_IN_PRIMARY").await;
+    let inserted_rows_count: u64 = run_command(&primary_postgres_client,
+                                               "INSERT INTO test_table VALUES (1, 'before replica')",
+                                               &[], "INSERT_DATA_IN_TABLE_IN_PRIMARY").await;
     assert_eq!(inserted_rows_count, 1, "Wrong number of rows inserted in table");
 
     // create replication slot
@@ -226,7 +223,7 @@ async fn test_end_to_end_replication() {
     assert_eq!(actual_note, "before replica", "note column value not as expected");
 }
 
-async fn run_query(client: &Client, query: &str, params: &[&(dyn ToSql + Sync)],context: &str)
+async fn run_query(client: &Client, query: &str, params: &[&(dyn ToSql + Sync)], context: &str)
         -> Row {
     match client
         .query_one(query, params)
@@ -234,6 +231,18 @@ async fn run_query(client: &Client, query: &str, params: &[&(dyn ToSql + Sync)],
         Ok(row) => return row,
         Err(e) => {
             panic!("failed to execute query {}, error: {}, message: {}", query, e, context);
+        }
+    }
+}
+
+async fn run_command(client: &Client, command: &str, params: &[&(dyn ToSql + Sync)], context: &str)
+        -> u64 {
+    match client
+        .execute(command, params)
+        .await {
+        Ok(num) => num,
+        Err(e) => {
+            panic!("failed to execute command {}, error: {}, message: {}", command, e, context);
         }
     }
 }
