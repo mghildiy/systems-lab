@@ -267,12 +267,8 @@ async fn run_query_for_timeperiod(client: &Client, query: &str, params: &[&(dyn 
             Ok(None) if std::time::Instant::now() >= start_time + std::time::Duration::from_secs(timeout)=> {
                 panic!("No data found in replica after {} seconds", timeout);
             },
-            Err(e) if std::time::Instant::now() >= start_time + std::time::Duration::from_secs(5)  => {
-                panic!("failed to execute query {}, error: {}, message: {}", query, e, context);
-            },
-            _ => {
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            }
+            Ok(None) => tokio::time::sleep(std::time::Duration::from_millis(100)).await,
+            Err(e) => panic!("query failed: {query}, error: {e}, context: {context}")
         }
     }
 }
