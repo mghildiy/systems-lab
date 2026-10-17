@@ -3,7 +3,7 @@ mod pb {
 }
 
 use tempfile::tempdir;
-use tokio_postgres::{Client, Error, Row};
+use tokio_postgres::{Client, Row};
 use tokio_postgres::types::ToSql;
 use pb::postgres_manager_client::PostgresManagerClient;
 use pb::{CreateReplicationSlotRequest, StartPrimaryRequest};
@@ -151,17 +151,17 @@ async fn test_start_primary_returns_error_when_postgres_exits_during_startup() {
 
 #[tokio::test]
 async fn test_end_to_end_replication() {
-    let (mut env, port) = create_env().await;
+    let (mut primary_env, primary_manager_port) = create_env().await;
 
     // create gRPC client
-    let channel_address = format!("http://127.0.0.1:{}", port);
+    let channel_address = format!("http://127.0.0.1:{}", primary_manager_port);
     let mut postgresmanager = postgresmanager_connect_with_retry(&channel_address)
                                         .await
                                         .expect("failed to connect to postgres manager");
     // start primary
     let primary_port = free_port();
     let start_primary_request = StartPrimaryRequest {
-        data_dir: env.data_dir.clone(),
+        data_dir: primary_env.data_dir.clone(),
         port: primary_port.into()
     };
     postgresmanager
@@ -207,25 +207,21 @@ async fn test_end_to_end_replication() {
     assert_eq!(&stored_lsn, lsn, "LSN mismatch");
 
     // launch replica
-    let replica_temp_dir = tempdir().expect("failed to create temp directory");
-    let replica_data_dir = replica_temp_dir
-        .path()
-        .to_str()
-        .expect("temp path is not valid UTF-8")
-        .to_string();
+    let (mut replica_env, replica_manager_port) = create_env().await;
     let replica_port = free_port();
     let start_replica_request = StartReplicaRequest {
-        data_dir: replica_data_dir.clone(),
+        data_dir: replica_env.data_dir.clone(),
         port: replica_port.into(),
         primary_host: "127.0.0.1".to_string(),
         primary_port: primary_port.into(),
         slot_name: slot_name.to_string()
     };
-    env.replica_temp_dir = Some(replica_temp_dir);
-    env.replica_data_dir = Some(replica_data_dir);
+    let replica_channel_address = format!("http://127.0.0.1:{}", replica_manager_port);
+    let mut replica_postgresmanager = postgresmanager_connect_with_retry(&replica_channel_address)
+        .await
+        .expect("failed to connect to postgres manager");
 
-
-    let start_replica_response = postgresmanager
+    replica_postgresmanager
         .start_replica(start_replica_request)
         .await
         .expect("failed to start replica");

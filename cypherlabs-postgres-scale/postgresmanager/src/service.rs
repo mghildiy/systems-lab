@@ -1,27 +1,39 @@
-use std::fmt::format;
+use crate::pb::postgres_manager_server::PostgresManager;
+use crate::pb::{CreateReplicationSlotRequest, CreateReplicationSlotResponse, StartPrimaryRequest, StartPrimaryResponse, StartReplicaRequest, StartReplicaResponse};
+use crate::service::Role::{Primary, Replica};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::Instant;
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 use tonic::{async_trait, Request, Response, Status};
-use crate::pb::postgres_manager_server::PostgresManager;
-use crate::pb::{CreateReplicationSlotRequest, CreateReplicationSlotResponse, StartPrimaryRequest, StartPrimaryResponse, StartReplicaRequest, StartReplicaResponse};
+
+enum Role {
+    Primary,
+    Replica,
+}
+
+enum Found {
+    Nothing,  // slot empty
+    Alive,    // a record exists and its postgres is still running
+    Stale,    // a record exists but its postgres has exited
+}
 
 struct RunningInstance {
     child: Child,
     port: u32,
-    data_dir: String
+    data_dir: String,
+    role: Role
 }
 
 pub(crate) struct PostgresManagerService {
-    running_instance: Arc<Mutex<Option<RunningInstance>>>
+    //running_instance: Arc<Mutex<Option<RunningInstance>>>
+    running_instance: Mutex<Option<RunningInstance>>
 }
 
 impl PostgresManagerService {
     pub(crate) fn new() -> Self {
-        let running_instance = Arc::new(Mutex::new(None));
+        let running_instance = Mutex::new(None);
         PostgresManagerService {
             running_instance
         }
@@ -33,6 +45,14 @@ impl PostgresManager for PostgresManagerService {
 
     async fn start_primary(&self, request: Request<StartPrimaryRequest>)
             -> Result<Response<StartPrimaryResponse>, Status> {
+        let mut guard = self.running_instance.lock().await;
+        let state = check_existing(&mut *guard, "START_PRIMARY_CHECK_EXISTING_INSTANCE")?;
+        match state {
+            Found::Alive  => return Err(Status::failed_precondition("Primary already running")),
+            Found::Stale => { *guard = None; }
+            Found::Nothing        => {}
+        }
+
         let start_primary_request = request.get_ref();
         let data_dir = &start_primary_request.data_dir;
         let port = start_primary_request.port;
@@ -80,7 +100,8 @@ impl PostgresManager for PostgresManagerService {
             return Err(e);
         }
 
-        *self.running_instance.lock().await = Some(RunningInstance{port, child: postgres_process, data_dir: data_dir.to_string()});
+        *guard = Some(RunningInstance{port, child: postgres_process,
+            data_dir: data_dir.to_string(), role: Primary});
         Ok(Response::new(StartPrimaryResponse { pid }))
     }
 
@@ -135,6 +156,14 @@ impl PostgresManager for PostgresManagerService {
 
     async fn start_replica(&self, request: Request<StartReplicaRequest>)
             -> Result<Response<StartReplicaResponse>, Status> {
+        let mut guard = self.running_instance.lock().await;
+        let state = check_existing(&mut *guard, "START_REPLICA_CHECK_EXISTING_INSTANCE")?;
+        match state {
+            Found::Alive  => return Err(Status::failed_precondition("Replica already running")),
+            Found::Stale => { *guard = None; }
+            Found::Nothing        => {}
+        }
+
         let request = request.get_ref();
         let data_dir = &request.data_dir;
         let port = request.port;
@@ -205,7 +234,8 @@ impl PostgresManager for PostgresManagerService {
             return Err(e);
         }
 
-        *self.running_instance.lock().await = Some(RunningInstance{port, child: postgres_process, data_dir: data_dir.to_string()});
+        *guard = Some(RunningInstance{port, child: postgres_process,
+            data_dir: data_dir.to_string(), role: Replica});
         Ok(Response::new(StartReplicaResponse { pid }))
     }
 }
@@ -256,5 +286,18 @@ async fn wait_until_pg_ready(pg_process: &mut Child, data_dir: &str, context: &s
             Err(e) => return Err(to_internal_status(context, e)),
         };
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+fn check_existing(slot: &mut Option<RunningInstance>, context: &str) -> Result<Found, Status> {
+    match slot {
+        Some(ri) => {
+            match ri.child.try_wait() {
+                Ok(Some(_)) => Ok(Found::Stale),    // child exited: stale record
+                Ok(None)    => Ok(Found::Alive),    // child still running
+                Err(e)      => Err(to_internal_status(context, e)),
+            }
+        },
+        None => Ok(Found::Nothing)
     }
 }
