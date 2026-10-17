@@ -10,8 +10,8 @@ use crate::pb::postgres_manager_server::PostgresManager;
 use crate::pb::{CreateReplicationSlotRequest, CreateReplicationSlotResponse, StartPrimaryRequest, StartPrimaryResponse, StartReplicaRequest, StartReplicaResponse};
 
 struct RunningInstance {
+    child: Child,
     port: u32,
-    pid: u32,
     data_dir: String
 }
 
@@ -80,7 +80,7 @@ impl PostgresManager for PostgresManagerService {
             return Err(e);
         }
 
-        *self.running_instance.lock().await = Some(RunningInstance{port, pid, data_dir: data_dir.to_string()});
+        *self.running_instance.lock().await = Some(RunningInstance{port, child: postgres_process, data_dir: data_dir.to_string()});
         Ok(Response::new(StartPrimaryResponse { pid }))
     }
 
@@ -205,7 +205,7 @@ impl PostgresManager for PostgresManagerService {
             return Err(e);
         }
 
-        *self.running_instance.lock().await = Some(RunningInstance{port, pid, data_dir: data_dir.to_string()});
+        *self.running_instance.lock().await = Some(RunningInstance{port, child: postgres_process, data_dir: data_dir.to_string()});
         Ok(Response::new(StartReplicaResponse { pid }))
     }
 }
