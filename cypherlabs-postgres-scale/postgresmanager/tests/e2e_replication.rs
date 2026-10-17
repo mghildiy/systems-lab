@@ -96,9 +96,7 @@ fn terminate_postgres(data_dir: &str) {
         .output();
 }
 
-#[tokio::test]
-async fn test_end_to_end_replication() {
-    // launch gRPC server, and create test env for clean up during panic
+async fn create_env() -> (TestEnv, u16) {
     let (server_process, port) = start_server().await;
     let temp_dir = tempdir().expect("failed to create temp directory");
     let data_dir = temp_dir
@@ -106,13 +104,54 @@ async fn test_end_to_end_replication() {
         .to_str()
         .expect("temp path is not valid UTF-8")
         .to_string();
-    let mut env = TestEnv {
-        server_process,
-        data_dir,
-        temp_dir,
-        replica_data_dir: None,
-        replica_temp_dir: None
+    (
+        TestEnv {
+            server_process,
+            data_dir,
+            temp_dir,
+            replica_data_dir: None,
+            replica_temp_dir: None
+        },
+        port
+    )
+}
+
+#[tokio::test]
+async fn test_start_primary_returns_error_when_postgres_exits_during_startup() {
+    let (env, port) = create_env().await;
+
+    // create gRPC client
+    let channel_address = format!("http://127.0.0.1:{}", port);
+    let mut postgresmanager = postgresmanager_connect_with_retry(&channel_address)
+        .await
+        .expect("failed to connect to postgres manager");
+
+    // start primary
+    let primary_port = free_port();
+    let start_primary_request = StartPrimaryRequest {
+        data_dir: env.data_dir.clone(),
+        port: primary_port.into()
     };
+    postgresmanager
+        .start_primary(start_primary_request)
+        .await
+        .expect("Starting primary failed");
+
+    // launch another primary on same port
+    let another_temp_dir = tempdir().expect("failed to create temp directory");
+    let start_primary_request = StartPrimaryRequest {
+        data_dir: another_temp_dir.path().to_str().expect("emp path is not valid UTF-8").to_string(),
+        port: primary_port.into()
+    };
+    let result = postgresmanager
+        .start_primary(start_primary_request)
+        .await;
+    assert!(result.is_err(), "second StartPrimary on a busy port should fail");
+}
+
+#[tokio::test]
+async fn test_end_to_end_replication() {
+    let (mut env, port) = create_env().await;
 
     // create gRPC client
     let channel_address = format!("http://127.0.0.1:{}", port);
@@ -121,7 +160,6 @@ async fn test_end_to_end_replication() {
                                         .expect("failed to connect to postgres manager");
     // start primary
     let primary_port = free_port();
-    println!("Primary port: {}", primary_port);
     let start_primary_request = StartPrimaryRequest {
         data_dir: env.data_dir.clone(),
         port: primary_port.into()
@@ -176,7 +214,6 @@ async fn test_end_to_end_replication() {
         .expect("temp path is not valid UTF-8")
         .to_string();
     let replica_port = free_port();
-    println!("Replica port: {}", replica_port);
     let start_replica_request = StartReplicaRequest {
         data_dir: replica_data_dir.clone(),
         port: replica_port.into(),

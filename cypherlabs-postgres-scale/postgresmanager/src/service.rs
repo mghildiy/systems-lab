@@ -1,6 +1,8 @@
+use std::fmt::format;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 use tonic::{async_trait, Request, Response, Status};
@@ -66,7 +68,7 @@ impl PostgresManager for PostgresManagerService {
         };
 
         // wait for postgres to be ready within a time period, else return
-        if let Err(e) = wait_until_pg_ready(&mut postgres_process, port, "TEST_READINESS_FOR_PRIMARY_PG")
+        if let Err(e) = wait_until_pg_ready(&mut postgres_process, data_dir, "TEST_READINESS_FOR_PRIMARY_PG")
             .await {
             let _ = postgres_process.kill().await;
             return Err(e);
@@ -177,7 +179,7 @@ impl PostgresManager for PostgresManagerService {
         // existing pid without spawning)? Revisit when Operator's real retry semantics are known.
 
         let mut postgres_command = Command::new("postgres");
-        let postgres_process = postgres_command
+        let mut postgres_process = postgres_command
             .arg("-D")
             .arg(data_dir)
             .arg("-p")
@@ -189,6 +191,13 @@ impl PostgresManager for PostgresManagerService {
             Some(pid) => pid,
             None => return Err(Status::internal("postgres pid not available")),
         };
+
+        // wait for postgres to be ready within a time period, else return error
+        if let Err(e) = wait_until_pg_ready(&mut postgres_process, data_dir, "TEST_READINESS_FOR_REPLICA_PG")
+            .await {
+            let _ = postgres_process.kill().await;
+            return Err(e);
+        }
 
         *self.postgres_port.lock().await = Some(port);
         Ok(Response::new(StartReplicaResponse { pid }))
@@ -215,32 +224,31 @@ fn run_command(command: &str, args: &[&str], context: &str) -> Result<Child, Sta
         .map_err(|e| to_internal_status(context, e))
 }
 
-async fn wait_until_pg_ready(pg_process: &mut Child, port: u32, context: &str) -> Result<(), Status> {
-    let _ = match pg_process.try_wait() {
-        Ok(Some(status)) => {
-            eprintln!("Postgres exited with status {}", status.to_string());
-            return Err(Status::internal("Postgres exited"))
-        },
-        Ok(None) => true,
-        Err(e) => return Err(to_internal_status(context, e)),
-    };
-
-    let start_time = std::time::Instant::now();
-    let timeout = 5;
-    let args = &["-h", "127.0.0.1", "-p", &port.to_string()];
+async fn wait_until_pg_ready(pg_process: &mut Child, data_dir: &str, context: &str) -> Result<(), Status> {
+    let deadline = Instant::now() + std::time::Duration::from_secs(10);
     loop {
-        match Command::new("pg_isready")
-            .args(args)
-            .output()
-            .await {
-                Ok(output) if output.status.success() => return Ok(()),
-                Ok(_) if std::time::Instant::now() >= start_time + std::time::Duration::from_secs(timeout)
-                    => {
-                    eprintln!("Postgres failed to be ready to accept requests for {}", context);
-                    return Err(Status::failed_precondition("Postgres not ready"))
-                },
-                Ok(_) => tokio::time::sleep(std::time::Duration::from_millis(100)).await,
-                Err(e) => return Err(to_internal_status(context, e)),
-            }
+        if Instant::now() > deadline {
+            return Err(Status::internal("Timeout while waiting for postgres to eb ready.".to_string()))
+        }
+
+        match pg_process.try_wait() {
+            Ok(Some(status)) => {
+                eprintln!("Postgres exited with status {}", status.to_string());
+                return Err(Status::internal(format!("Postgres exited with status: {}", status.to_string())));
+            },
+            Ok(None) => {
+                let pid_file = Path::new(data_dir).join("postmaster.pid");
+                match tokio::fs::read_to_string(&pid_file).await {
+                    Ok(contents) if matches!(contents.lines().last().map(str::trim), Some("ready") | Some("standby")) => {
+                        return Ok(());
+                    }
+                    Ok(_) => {}, // file exists, but not ready yet
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}   // not written yet
+                    Err(e) => return Err(to_internal_status("READ_POSTMASTER_PID", e)),
+                }
+            },
+            Err(e) => return Err(to_internal_status(context, e)),
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 }
