@@ -9,15 +9,21 @@ use tonic::{async_trait, Request, Response, Status};
 use crate::pb::postgres_manager_server::PostgresManager;
 use crate::pb::{CreateReplicationSlotRequest, CreateReplicationSlotResponse, StartPrimaryRequest, StartPrimaryResponse, StartReplicaRequest, StartReplicaResponse};
 
+struct RunningInstance {
+    port: u32,
+    pid: u32,
+    data_dir: String
+}
+
 pub(crate) struct PostgresManagerService {
-    postgres_port: Arc<Mutex<Option<u32>>>
+    running_instance: Arc<Mutex<Option<RunningInstance>>>
 }
 
 impl PostgresManagerService {
     pub(crate) fn new() -> Self {
-        let postgres_port = Arc::new(Mutex::new(None));
+        let running_instance = Arc::new(Mutex::new(None));
         PostgresManagerService {
-            postgres_port
+            running_instance
         }
     }
 }
@@ -74,16 +80,16 @@ impl PostgresManager for PostgresManagerService {
             return Err(e);
         }
 
-        *self.postgres_port.lock().await = Some(port);
+        *self.running_instance.lock().await = Some(RunningInstance{port, pid, data_dir: data_dir.to_string()});
         Ok(Response::new(StartPrimaryResponse { pid }))
     }
 
     async fn create_replication_slot(&self, request: Request<CreateReplicationSlotRequest>)
             -> Result<Response<CreateReplicationSlotResponse>, Status> {
         let create_replication_slot_request = request.get_ref();
-        let guard = self.postgres_port.lock().await;
-        let port = match *guard {
-            Some(port) => port,
+        let guard = self.running_instance.lock().await;
+        let port = match &*guard {
+            Some(ri) => ri.port,
             None => return Err(Status::failed_precondition("Primary is not running; call StartPrimary first")),
         };
         drop(guard);
@@ -199,7 +205,7 @@ impl PostgresManager for PostgresManagerService {
             return Err(e);
         }
 
-        *self.postgres_port.lock().await = Some(port);
+        *self.running_instance.lock().await = Some(RunningInstance{port, pid, data_dir: data_dir.to_string()});
         Ok(Response::new(StartReplicaResponse { pid }))
     }
 }
