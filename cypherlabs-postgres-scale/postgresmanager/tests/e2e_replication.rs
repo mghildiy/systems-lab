@@ -5,6 +5,7 @@ mod pb {
 use tempfile::tempdir;
 use tokio_postgres::{Client, Row};
 use tokio_postgres::types::ToSql;
+use tonic::IntoRequest;
 use pb::postgres_manager_client::PostgresManagerClient;
 use pb::{CreateReplicationSlotRequest, StartPrimaryRequest};
 use crate::pb::StartReplicaRequest;
@@ -118,35 +119,52 @@ async fn create_env() -> (TestEnv, u16) {
 
 #[tokio::test]
 async fn test_start_primary_returns_error_when_postgres_exits_during_startup() {
-    let (env, port) = create_env().await;
+    //let (env, port) = create_env().await;
+    let (env_a, manager_a_port) = create_env().await;
 
     // create gRPC client
-    let channel_address = format!("http://127.0.0.1:{}", port);
-    let mut postgresmanager = postgresmanager_connect_with_retry(&channel_address)
+    let channel_a = format!("http://127.0.0.1:{}", manager_a_port);
+    let mut postgresmanager_a = postgresmanager_connect_with_retry(&channel_a)
         .await
         .expect("failed to connect to postgres manager");
 
     // start primary
     let primary_port = free_port();
-    let start_primary_request = StartPrimaryRequest {
-        data_dir: env.data_dir.clone(),
+    let start_primary_request_a = StartPrimaryRequest {
+        data_dir: env_a.data_dir.clone(),
         port: primary_port.into()
     };
-    postgresmanager
-        .start_primary(start_primary_request)
+    postgresmanager_a
+        .start_primary(start_primary_request_a)
         .await
         .expect("Starting primary failed");
 
     // launch another primary on same port
-    let another_temp_dir = tempdir().expect("failed to create temp directory");
-    let start_primary_request = StartPrimaryRequest {
-        data_dir: another_temp_dir.path().to_str().expect("emp path is not valid UTF-8").to_string(),
+    let (env_b, manager_b_port) = create_env().await;
+    let channel_b = format!("http://127.0.0.1:{}", manager_b_port);
+    let mut postgresmanager_b = postgresmanager_connect_with_retry(&channel_b)
+        .await
+        .expect("failed to connect to postgres manager");
+    let start_primary_request_b = StartPrimaryRequest {
+        data_dir: env_b.data_dir.clone(),
         port: primary_port.into()
     };
-    let result = postgresmanager
-        .start_primary(start_primary_request)
+
+
+    let result = postgresmanager_b
+        .start_primary(start_primary_request_b)
         .await;
     assert!(result.is_err(), "second StartPrimary on a busy port should fail");
+    let status = match result {
+        Ok(_) => panic!("StartPrimary on a busy port should fail"),
+        Err(status) => status,
+    };
+    assert_eq!(status.code(), tonic::Code::Internal);
+    assert!(
+        status.message().contains("exited"),
+        "expected a postgres-exited error, got: {}",
+        status.message()
+    );
 }
 
 #[tokio::test]

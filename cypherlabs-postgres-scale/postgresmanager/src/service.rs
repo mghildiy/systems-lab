@@ -27,7 +27,6 @@ struct RunningInstance {
 }
 
 pub(crate) struct PostgresManagerService {
-    //running_instance: Arc<Mutex<Option<RunningInstance>>>
     running_instance: Mutex<Option<RunningInstance>>
 }
 
