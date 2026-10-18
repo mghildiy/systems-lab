@@ -5,7 +5,6 @@ mod pb {
 use tempfile::tempdir;
 use tokio_postgres::{Client, Row};
 use tokio_postgres::types::ToSql;
-use tonic::IntoRequest;
 use pb::postgres_manager_client::PostgresManagerClient;
 use pb::{CreateReplicationSlotRequest, StartPrimaryRequest};
 use crate::pb::StartReplicaRequest;
@@ -118,8 +117,45 @@ async fn create_env() -> (TestEnv, u16) {
 }
 
 #[tokio::test]
+async fn start_primary_fails_when_instance_already_running() {
+    let (env, manager_port) = create_env().await;
+    let channel = format!("http://127.0.0.1:{}", manager_port);
+    let mut postgresmanager = postgresmanager_connect_with_retry(&channel)
+        .await
+        .expect("failed to connect to postgres manager");
+    let primary_port = free_port();
+    let start_primary_request = StartPrimaryRequest {
+        data_dir: env.data_dir.clone(),
+        port: primary_port.into()
+    };
+    postgresmanager
+        .start_primary(start_primary_request)
+        .await
+        .expect("Starting primary failed");
+
+    // call again on same manager, with same request
+    let start_primary_request_repeat = StartPrimaryRequest {
+        data_dir: env.data_dir.clone(),
+        port: primary_port.into()
+    };
+    let result = postgresmanager
+        .start_primary(start_primary_request_repeat)
+        .await;
+    assert!(result.is_err(), "second StartPrimary on a busy port should fail");
+    let status = match result {
+        Ok(_) => panic!("StartPrimary when already running should fail"),
+        Err(status) => status,
+    };
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        status.message().contains("Primary already running"),
+        "expected a postgres-exited error, got: {}",
+        status.message()
+    );
+}
+
+#[tokio::test]
 async fn test_start_primary_returns_error_when_postgres_exits_during_startup() {
-    //let (env, port) = create_env().await;
     let (env_a, manager_a_port) = create_env().await;
 
     // create gRPC client
@@ -169,7 +205,7 @@ async fn test_start_primary_returns_error_when_postgres_exits_during_startup() {
 
 #[tokio::test]
 async fn test_end_to_end_replication() {
-    let (mut primary_env, primary_manager_port) = create_env().await;
+    let (primary_env, primary_manager_port) = create_env().await;
 
     // create gRPC client
     let channel_address = format!("http://127.0.0.1:{}", primary_manager_port);
@@ -225,7 +261,7 @@ async fn test_end_to_end_replication() {
     assert_eq!(&stored_lsn, lsn, "LSN mismatch");
 
     // launch replica
-    let (mut replica_env, replica_manager_port) = create_env().await;
+    let (replica_env, replica_manager_port) = create_env().await;
     let replica_port = free_port();
     let start_replica_request = StartReplicaRequest {
         data_dir: replica_env.data_dir.clone(),
