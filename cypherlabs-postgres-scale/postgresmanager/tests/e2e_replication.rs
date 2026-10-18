@@ -12,7 +12,7 @@ use crate::pb::StartReplicaRequest;
 struct TestEnv {
     server_process: tokio::process::Child,
     data_dir: String,
-    temp_dir: tempfile::TempDir,
+    _temp_dir: tempfile::TempDir,
     replica_data_dir: Option<String>,
     replica_temp_dir: Option<tempfile::TempDir>
 }
@@ -108,7 +108,7 @@ async fn create_env() -> (TestEnv, u16) {
         TestEnv {
             server_process,
             data_dir,
-            temp_dir,
+            _temp_dir: temp_dir,
             replica_data_dir: None,
             replica_temp_dir: None
         },
@@ -147,8 +147,9 @@ async fn start_primary_fails_when_instance_already_running() {
         Err(status) => status,
     };
     assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+    println!("{}", status.message());
     assert!(
-        status.message().contains("Primary already running"),
+        status.message().contains("already running as Primary on port"),
         "expected a postgres-exited error, got: {}",
         status.message()
     );

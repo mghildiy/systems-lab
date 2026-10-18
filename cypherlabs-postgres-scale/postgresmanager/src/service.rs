@@ -8,6 +8,7 @@ use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 use tonic::{async_trait, Request, Response, Status};
 
+#[derive(Debug, Clone, Copy, PartialEq)]
 enum Role {
     Primary,
     Replica,
@@ -15,7 +16,7 @@ enum Role {
 
 enum Found {
     Nothing,  // slot empty
-    Alive,    // a record exists and its postgres is still running
+    Alive{ role: Role, port: u32 },    // a record exists and its postgres is still running
     Stale,    // a record exists but its postgres has exited
 }
 
@@ -47,9 +48,11 @@ impl PostgresManager for PostgresManagerService {
         let mut guard = self.running_instance.lock().await;
         let state = check_existing(&mut *guard, "START_PRIMARY_CHECK_EXISTING_INSTANCE")?;
         match state {
-            Found::Alive  => return Err(Status::failed_precondition("Primary already running")),
+            Found::Alive { role, port } => return Err(Status::failed_precondition(
+                format!("already running as {:?} on port {}", role, port)
+            )),
             Found::Stale => { *guard = None; }
-            Found::Nothing        => {}
+            Found::Nothing => {}
         }
 
         let start_primary_request = request.get_ref();
@@ -73,15 +76,9 @@ impl PostgresManager for PostgresManagerService {
             }
         }
 
-        // TODO(v0 gap): if a postgres instance is already running against this data_dir
-        // (detectable via postmaster.pid's pid still being alive), StartPrimary currently
-        // has no check for this and will attempt to spawn a second postgres, which will
-        // fail due to port/lock conflicts — but since postgres's spawn() succeeding doesn't
-        // mean it stayed running, the current code would still report a false-positive
-        // success (returning a pid for a process that immediately exited).
-        // Decision deferred: should a call against an already-running instance be (a) an
-        // error (FAILED_PRECONDITION/ALREADY_EXISTS), or (b) idempotent success (return the
-        // existing pid without spawning)? Revisit when Operator's real retry semantics are known.
+        // TODO: after a manager restart, state is empty even if a postgres is still running
+        // on this data_dir (orphan from a crash). Detect via postmaster.pid (pid alive?)
+        // and either adopt or refuse. Mostly prevented by graceful shutdown (see main.rs).
 
         let mut postgres_process = run_command("postgres",
                                                &["-D", data_dir, "-p", &port.to_string()],
@@ -158,7 +155,9 @@ impl PostgresManager for PostgresManagerService {
         let mut guard = self.running_instance.lock().await;
         let state = check_existing(&mut *guard, "START_REPLICA_CHECK_EXISTING_INSTANCE")?;
         match state {
-            Found::Alive  => return Err(Status::failed_precondition("Replica already running")),
+            Found::Alive { role, port } => return Err(Status::failed_precondition(
+                format!("already running as {:?} on port {}", role, port)
+            )),
             Found::Stale => { *guard = None; }
             Found::Nothing        => {}
         }
@@ -202,15 +201,9 @@ impl PostgresManager for PostgresManagerService {
             return Err(Status::internal(format!("pg_basebackup failed with status: {}", exit_status)));
         }
 
-        // TODO(v0 gap): if a postgres instance is already running against this data_dir
-        // (detectable via postmaster.pid's pid still being alive), StartPrimary currently
-        // has no check for this and will attempt to spawn a second postgres, which will
-        // fail due to port/lock conflicts — but since postgres's spawn() succeeding doesn't
-        // mean it stayed running, the current code would still report a false-positive
-        // success (returning a pid for a process that immediately exited).
-        // Decision deferred: should a call against an already-running instance be (a) an
-        // error (FAILED_PRECONDITION/ALREADY_EXISTS), or (b) idempotent success (return the
-        // existing pid without spawning)? Revisit when Operator's real retry semantics are known.
+        // TODO: after a manager restart, state is empty even if a postgres is still running
+        // on this data_dir (orphan from a crash). Detect via postmaster.pid (pid alive?)
+        // and either adopt or refuse. Mostly prevented by graceful shutdown (see main.rs).
 
         let mut postgres_command = Command::new("postgres");
         let mut postgres_process = postgres_command
@@ -293,7 +286,7 @@ fn check_existing(slot: &mut Option<RunningInstance>, context: &str) -> Result<F
         Some(ri) => {
             match ri.child.try_wait() {
                 Ok(Some(_)) => Ok(Found::Stale),    // child exited: stale record
-                Ok(None)    => Ok(Found::Alive),    // child still running
+                Ok(None)    => Ok(Found::Alive {role: ri.role, port: ri.port }),    // child still running
                 Err(e)      => Err(to_internal_status(context, e)),
             }
         },
