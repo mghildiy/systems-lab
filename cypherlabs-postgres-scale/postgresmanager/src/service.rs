@@ -1,3 +1,4 @@
+use crate::pb::{State, StatusRequest, StatusResponse, Role as PbRole};
 use crate::pb::postgres_manager_server::PostgresManager;
 use crate::pb::{CreateReplicationSlotRequest, CreateReplicationSlotResponse, StartPrimaryRequest, StartPrimaryResponse, StartReplicaRequest, StartReplicaResponse};
 use crate::service::Role::{Primary, Replica};
@@ -230,6 +231,38 @@ impl PostgresManager for PostgresManagerService {
             data_dir: data_dir.to_string(), role: Replica});
         Ok(Response::new(StartReplicaResponse { pid }))
     }
+    async fn status(&self, _request: Request<StatusRequest>)
+                    -> Result<Response<StatusResponse>, Status> {
+        let mut guard = self.running_instance.lock().await;
+        let response = match  guard.as_mut() {
+            Some(ri) => {
+                match ri.child.try_wait() {
+                    Ok(None) => StatusResponse {
+                        state: State::Running as i32,
+                        role: to_pb_role(ri.role) as i32,
+                        port: ri.port,
+                        pid: ri.child.id().unwrap_or(0),
+                    },
+                    Ok(Some(_)) => StatusResponse {
+                        state: State::Exited as i32,
+                        role: to_pb_role(ri.role) as i32,
+                        port: ri.port,
+                        pid: 0,
+                    },
+                    Err(e) => return Err(to_internal_status("STATUS_CHECK_CHILD_EXITED", e))
+                }
+            },
+            None => StatusResponse {
+                        state: State::NotStarted as i32,
+                        role: PbRole::Unspecified as i32,
+                        port: 0,
+                        pid: 0
+                }
+        };
+
+        Ok(Response::new(response))
+
+    }
 }
 
 fn postgres_connection_string(user: &str, password: &str, host: &str, port: u32, database: &str) -> String {
@@ -291,5 +324,12 @@ fn check_existing(slot: &mut Option<RunningInstance>, context: &str) -> Result<F
             }
         },
         None => Ok(Found::Nothing)
+    }
+}
+
+fn to_pb_role(role: Role) -> PbRole {
+    match role {
+        Primary => PbRole::Primary,
+        Replica => PbRole::Replica,
     }
 }

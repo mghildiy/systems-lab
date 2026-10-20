@@ -7,7 +7,7 @@ use tokio_postgres::{Client, Row};
 use tokio_postgres::types::ToSql;
 use pb::postgres_manager_client::PostgresManagerClient;
 use pb::{CreateReplicationSlotRequest, StartPrimaryRequest};
-use crate::pb::StartReplicaRequest;
+use crate::pb::{Role, StartReplicaRequest, State, StatusRequest};
 
 struct TestEnv {
     server_process: tokio::process::Child,
@@ -202,6 +202,56 @@ async fn test_start_primary_returns_error_when_postgres_exits_during_startup() {
         "expected a postgres-exited error, got: {}",
         status.message()
     );
+}
+
+#[tokio::test]
+async fn status_reflects_manager_lifecycle() {
+    let (env, manager_port) = create_env().await;
+    let channel_address = format!("http://127.0.0.1:{}", manager_port);
+    let mut postgresmanager = postgresmanager_connect_with_retry(&channel_address)
+        .await
+        .expect("failed to connect to postgres manager");
+
+    let status_request = StatusRequest {};
+    let response = postgresmanager.status(status_request)
+        .await
+        .expect("failed to get status response");
+    let status = response.into_inner();
+    assert_eq!(status.state, State::NotStarted as i32, "Wrong state");
+    assert_eq!(status.role, Role::Unspecified as i32, "Wrong role");
+    assert_eq!(status.port, 0, "Wrong port");
+    assert_eq!(status.pid, 0, "Wrong pid");
+
+    // start primary
+    let primary_port = free_port();
+    let start_primary_request = StartPrimaryRequest {
+        data_dir: env.data_dir.clone(),
+        port: primary_port.into()
+    };
+    let start_primary_response = postgresmanager
+        .start_primary(start_primary_request)
+        .await
+        .expect("Starting primary failed");
+
+    let response = postgresmanager.status(status_request)
+        .await
+        .expect("failed to get status response");
+    let status = response.into_inner();
+    assert_eq!(status.state, State::Running as i32, "Wrong state");
+    assert_eq!(status.role, Role::Primary as i32, "Wrong role");
+    assert_eq!(status.port, u32::from(primary_port), "Wrong port");
+    assert_eq!(status.pid, start_primary_response.get_ref().pid, "Wrong pid");
+
+    // kill primary
+    terminate_postgres(&env.data_dir);
+    let response = postgresmanager.status(status_request)
+        .await
+        .expect("failed to get status response");
+    let status = response.into_inner();
+    assert_eq!(status.state, State::Exited as i32, "Wrong state");
+    assert_eq!(status.role, Role::Primary as i32, "Wrong role");
+    assert_eq!(status.port, u32::from(primary_port), "Wrong port");
+    assert_eq!(status.pid, 0, "Wrong pid");
 }
 
 #[tokio::test]

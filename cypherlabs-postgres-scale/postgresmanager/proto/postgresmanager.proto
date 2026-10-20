@@ -6,6 +6,7 @@ service PostgresManager {
     rpc StartPrimary (StartPrimaryRequest) returns (StartPrimaryResponse);
     rpc CreateReplicationSlot (CreateReplicationSlotRequest) returns (CreateReplicationSlotResponse);
     rpc StartReplica (StartReplicaRequest) returns (StartReplicaResponse);
+    rpc Status (StatusRequest) returns (StatusResponse);
 }
 
 message StartPrimaryRequest {
@@ -35,4 +36,28 @@ message StartReplicaRequest {
 
 message StartReplicaResponse {
     uint32 pid = 1;
+}
+
+message StatusRequest {
+
+}
+
+enum State {
+    STATE_UNSPECIFIED = 0;
+    STATE_NOT_STARTED = 1;
+    STATE_RUNNING = 2;
+    STATE_EXITED = 3;
+}
+
+enum Role {
+    ROLE_UNSPECIFIED = 0;
+    ROLE_PRIMARY = 1;
+    ROLE_REPLICA = 2;
+}
+
+message StatusResponse {
+    State state = 1;
+    Role role = 2;
+    uint32 port = 3;
+    uint32 pid = 4;
 }
