@@ -1,4 +1,4 @@
-use crate::pb::{State, StatusRequest, StatusResponse, Role as PbRole};
+use crate::pb::{State, StatusRequest, StatusResponse, Role as PbRole, PromoteRequest, PromoteResponse};
 use crate::pb::postgres_manager_server::PostgresManager;
 use crate::pb::{CreateReplicationSlotRequest, CreateReplicationSlotResponse, StartPrimaryRequest, StartPrimaryResponse, StartReplicaRequest, StartReplicaResponse};
 use crate::service::Role::{Primary, Replica};
@@ -91,7 +91,9 @@ impl PostgresManager for PostgresManagerService {
         };
 
         // wait for postgres to be ready within a time period, else return
-        if let Err(e) = wait_until_pg_ready(&mut postgres_process, data_dir, "TEST_READINESS_FOR_PRIMARY_PG")
+        if let Err(e) = wait_until_pg_ready(&mut postgres_process, data_dir,
+                                            "TEST_READINESS_FOR_PRIMARY_PG",
+                                            &["ready"])
             .await {
             let _ = postgres_process.kill().await;
             return Err(e);
@@ -221,7 +223,9 @@ impl PostgresManager for PostgresManagerService {
         };
 
         // wait for postgres to be ready within a time period, else return error
-        if let Err(e) = wait_until_pg_ready(&mut postgres_process, data_dir, "TEST_READINESS_FOR_REPLICA_PG")
+        if let Err(e) = wait_until_pg_ready(&mut postgres_process, data_dir,
+                                            "TEST_READINESS_FOR_REPLICA_PG",
+                                            &["ready", "standby"])
             .await {
             let _ = postgres_process.kill().await;
             return Err(e);
@@ -263,6 +267,33 @@ impl PostgresManager for PostgresManagerService {
         Ok(Response::new(response))
 
     }
+    async fn promote(&self, request: Request<PromoteRequest>)
+            -> Result<Response<PromoteResponse>, Status> {
+        let mut guard = self.running_instance.lock().await;
+
+        let ri = match guard.as_mut() {
+            Some(ri) => ri,
+            None => return Err(Status::failed_precondition("no database process running, nothing to promote")),
+        };
+
+        if ri.role == Primary {
+            return Err(Status::failed_precondition("already a primary"));
+        }
+
+        let mut promotion_process = run_command("pg_ctl",
+                                               &["promote", "-D", &ri.data_dir],
+                                               "PROMOTE_REPLICA_SPAWN")?;
+
+        let status = promotion_process.wait().await
+            .map_err(|e| to_internal_status("PROMOTE_WAIT", e))?;
+        if !status.success() {
+            return Err(Status::internal(format!("Promotion to primary failed: {status}")));
+        }
+        ri.role = Primary;
+
+        Ok(Response::new(PromoteResponse {}))
+
+    }
 }
 
 fn postgres_connection_string(user: &str, password: &str, host: &str, port: u32, database: &str) -> String {
@@ -285,11 +316,12 @@ fn run_command(command: &str, args: &[&str], context: &str) -> Result<Child, Sta
         .map_err(|e| to_internal_status(context, e))
 }
 
-async fn wait_until_pg_ready(pg_process: &mut Child, data_dir: &str, context: &str) -> Result<(), Status> {
+async fn wait_until_pg_ready(pg_process: &mut Child, data_dir: &str, context: &str, acceptable_statuses: &[&str])
+        -> Result<(), Status> {
     let deadline = Instant::now() + std::time::Duration::from_secs(10);
     loop {
         if Instant::now() > deadline {
-            return Err(Status::internal("Timeout while waiting for postgres to eb ready.".to_string()))
+            return Err(Status::internal("Timeout while waiting for postgres to be ready.".to_string()))
         }
 
         match pg_process.try_wait() {
@@ -300,7 +332,11 @@ async fn wait_until_pg_ready(pg_process: &mut Child, data_dir: &str, context: &s
             Ok(None) => {
                 let pid_file = Path::new(data_dir).join("postmaster.pid");
                 match tokio::fs::read_to_string(&pid_file).await {
-                    Ok(contents) if matches!(contents.lines().last().map(str::trim), Some("ready") | Some("standby")) => {
+                    Ok(contents) if contents
+                        .lines()
+                        .last()
+                        .map(str::trim)
+                        .is_some_and(|s| acceptable_statuses.contains(&s)) => {
                         return Ok(());
                     }
                     Ok(_) => {}, // file exists, but not ready yet

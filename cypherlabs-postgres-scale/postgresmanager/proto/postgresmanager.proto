@@ -7,6 +7,7 @@ service PostgresManager {
     rpc CreateReplicationSlot (CreateReplicationSlotRequest) returns (CreateReplicationSlotResponse);
     rpc StartReplica (StartReplicaRequest) returns (StartReplicaResponse);
     rpc Status (StatusRequest) returns (StatusResponse);
+    rpc Promote (PromoteRequest) returns (PromoteResponse);
 }
 
 message StartPrimaryRequest {
@@ -60,4 +61,12 @@ message StatusResponse {
     Role role = 2;
     uint32 port = 3;
     uint32 pid = 4;
+}
+
+message PromoteRequest {
+
+}
+
+message PromoteResponse {
+
 }

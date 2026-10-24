@@ -7,7 +7,7 @@ use tokio_postgres::{Client, Row};
 use tokio_postgres::types::ToSql;
 use pb::postgres_manager_client::PostgresManagerClient;
 use pb::{CreateReplicationSlotRequest, StartPrimaryRequest};
-use crate::pb::{Role, StartReplicaRequest, State, StatusRequest};
+use crate::pb::{PromoteRequest, Role, StartReplicaRequest, State, StatusRequest};
 
 struct TestEnv {
     server_process: tokio::process::Child,
@@ -357,6 +357,89 @@ async fn test_end_to_end_replication() {
                              &[], "CHECK_REPLICA_DATA").await;
     let actual_note: String = replica_data_record.get(0);
     assert_eq!(actual_note, "after replica", "note column value not as expected");
+}
+
+#[tokio::test]
+async fn promote_turns_replica_into_primary() {
+    let (primary_env, primary_manager_port) = create_env().await;
+
+    // create gRPC client
+    let channel_address = format!("http://127.0.0.1:{}", primary_manager_port);
+    let mut postgresmanager = postgresmanager_connect_with_retry(&channel_address)
+        .await
+        .expect("failed to connect to postgres manager");
+    // start primary
+    let primary_port = free_port();
+    let start_primary_request = StartPrimaryRequest {
+        data_dir: primary_env.data_dir.clone(),
+        port: primary_port.into()
+    };
+    postgresmanager
+        .start_primary(start_primary_request)
+        .await
+        .expect("Starting primary failed");
+
+    // create replication slot
+    let slot_name = "test_replication_slot";
+    let create_replication_slot_response = postgresmanager
+        .create_replication_slot(CreateReplicationSlotRequest {
+            slot_name: slot_name.to_string()
+        })
+        .await
+        .expect("failed to create replication slot");
+    let lsn = &create_replication_slot_response.get_ref().lsn;
+    assert!(!lsn.is_empty(), "Empty LSN not allowed");
+    let lsn_parts: Vec<_> = lsn.split("/").collect();
+    assert_eq!(lsn_parts.len(), 2, "LSN must have 2 parts");
+    let hi = u64::from_str_radix(lsn_parts[0], 16).expect("bad hi in LSN");
+    let lo = u64::from_str_radix(lsn_parts[1], 16).expect("bad lo in LSN");
+    let lsn_value = (hi << 32) | lo;
+    assert!(lsn_value > 0, "LSN should be a real WAL position");
+
+    // start replica
+    let (replica_env, replica_manager_port) = create_env().await;
+    let replica_port = free_port();
+    let start_replica_request = StartReplicaRequest {
+        data_dir: replica_env.data_dir.clone(),
+        port: replica_port.into(),
+        primary_host: "127.0.0.1".to_string(),
+        primary_port: primary_port.into(),
+        slot_name: slot_name.to_string()
+    };
+    let replica_channel_address = format!("http://127.0.0.1:{}", replica_manager_port);
+    let mut replica_postgresmanager = postgresmanager_connect_with_retry(&replica_channel_address)
+        .await
+        .expect("failed to connect to postgres manager");
+
+    replica_postgresmanager
+        .start_replica(start_replica_request)
+        .await
+        .expect("failed to start replica");
+
+    // ensure recovery  mode is true
+    let usr = std::env::var("USER").unwrap_or_default();
+    let replica_connection_string = postgres_connection_string(&usr, "", "127.0.0.1",
+                                                               replica_port.into(), "postgres");
+    let replica_postgres_client= postgres_connect_with_retry(&replica_connection_string)
+        .await
+        .expect("failed to connect to replica");
+
+    let recovery_status_record = run_query(&replica_postgres_client,
+                                           "SELECT pg_is_in_recovery()", &[],
+                                           "CHECK_REPLICA_RECOVERY_STATUS").await;
+    let is_recovery_mode_on: bool = recovery_status_record.get(0);
+    assert!(is_recovery_mode_on, "Recovery mode for replica must be TRUE");
+
+    // promote replica
+    let promote_request = PromoteRequest {};
+    let promote_response = replica_postgresmanager
+        .promote(promote_request).await.expect("failed to promote replica");
+
+    let recovery_status_record = run_query(&replica_postgres_client,
+                                                   "SELECT pg_is_in_recovery()", &[],
+                                                   "CHECK_REPLICA_RECOVERY_STATUS").await;
+    let is_recovery_mode_on: bool = recovery_status_record.get(0);
+    assert!(!is_recovery_mode_on, "Recovery mode for replica must be FALSE");
 }
 
 async fn run_query(client: &Client, query: &str, params: &[&(dyn ToSql + Sync)], context: &str)
