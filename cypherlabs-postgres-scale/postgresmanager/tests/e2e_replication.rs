@@ -5,9 +5,10 @@ mod pb {
 use tempfile::tempdir;
 use tokio_postgres::{Client, Row};
 use tokio_postgres::types::ToSql;
+use tonic::transport::Channel;
 use pb::postgres_manager_client::PostgresManagerClient;
 use pb::{CreateReplicationSlotRequest, StartPrimaryRequest};
-use crate::pb::{PromoteRequest, Role, StartReplicaRequest, State, StatusRequest};
+use crate::pb::{PromoteRequest, Role, StartPrimaryResponse, StartReplicaRequest, StartReplicaResponse, State, StatusRequest};
 
 struct TestEnv {
     server_process: tokio::process::Child,
@@ -120,25 +121,19 @@ async fn create_env() -> (TestEnv, u16) {
 async fn start_primary_fails_when_instance_already_running() {
     let (env, manager_port) = create_env().await;
     let channel = format!("http://127.0.0.1:{}", manager_port);
-    let mut postgresmanager = postgresmanager_connect_with_retry(&channel)
+    let mut pg_manager = postgresmanager_connect_with_retry(&channel)
         .await
         .expect("failed to connect to postgres manager");
+
     let primary_port = free_port();
-    let start_primary_request = StartPrimaryRequest {
-        data_dir: env.data_dir.clone(),
-        port: primary_port.into()
-    };
-    postgresmanager
-        .start_primary(start_primary_request)
-        .await
-        .expect("Starting primary failed");
+    start_primary(&env, &mut pg_manager, primary_port).await;
 
     // call again on same manager, with same request
     let start_primary_request_repeat = StartPrimaryRequest {
         data_dir: env.data_dir.clone(),
         port: primary_port.into()
     };
-    let result = postgresmanager
+    let result = pg_manager
         .start_primary(start_primary_request_repeat)
         .await;
     assert!(result.is_err(), "second StartPrimary on a busy port should fail");
@@ -167,14 +162,7 @@ async fn test_start_primary_returns_error_when_postgres_exits_during_startup() {
 
     // start primary
     let primary_port = free_port();
-    let start_primary_request_a = StartPrimaryRequest {
-        data_dir: env_a.data_dir.clone(),
-        port: primary_port.into()
-    };
-    postgresmanager_a
-        .start_primary(start_primary_request_a)
-        .await
-        .expect("Starting primary failed");
+    start_primary(&env_a, &mut postgresmanager_a, primary_port).await;
 
     // launch another primary on same port
     let (env_b, manager_b_port) = create_env().await;
@@ -208,12 +196,12 @@ async fn test_start_primary_returns_error_when_postgres_exits_during_startup() {
 async fn status_reflects_manager_lifecycle() {
     let (env, manager_port) = create_env().await;
     let channel_address = format!("http://127.0.0.1:{}", manager_port);
-    let mut postgresmanager = postgresmanager_connect_with_retry(&channel_address)
+    let mut pg_manager = postgresmanager_connect_with_retry(&channel_address)
         .await
         .expect("failed to connect to postgres manager");
 
     let status_request = StatusRequest {};
-    let response = postgresmanager.status(status_request)
+    let response = pg_manager.status(status_request)
         .await
         .expect("failed to get status response");
     let status = response.into_inner();
@@ -224,27 +212,20 @@ async fn status_reflects_manager_lifecycle() {
 
     // start primary
     let primary_port = free_port();
-    let start_primary_request = StartPrimaryRequest {
-        data_dir: env.data_dir.clone(),
-        port: primary_port.into()
-    };
-    let start_primary_response = postgresmanager
-        .start_primary(start_primary_request)
-        .await
-        .expect("Starting primary failed");
+    let start_primary_response = start_primary(&env, &mut pg_manager, primary_port).await;
 
-    let response = postgresmanager.status(status_request)
+    let response = pg_manager.status(status_request)
         .await
         .expect("failed to get status response");
     let status = response.into_inner();
     assert_eq!(status.state, State::Running as i32, "Wrong state");
     assert_eq!(status.role, Role::Primary as i32, "Wrong role");
     assert_eq!(status.port, u32::from(primary_port), "Wrong port");
-    assert_eq!(status.pid, start_primary_response.get_ref().pid, "Wrong pid");
+    assert_eq!(status.pid, start_primary_response.pid, "Wrong pid");
 
     // kill primary
     terminate_postgres(&env.data_dir);
-    let response = postgresmanager.status(status_request)
+    let response = pg_manager.status(status_request)
         .await
         .expect("failed to get status response");
     let status = response.into_inner();
@@ -260,19 +241,12 @@ async fn test_end_to_end_replication() {
 
     // create gRPC client
     let channel_address = format!("http://127.0.0.1:{}", primary_manager_port);
-    let mut postgresmanager = postgresmanager_connect_with_retry(&channel_address)
+    let mut pg_manager = postgresmanager_connect_with_retry(&channel_address)
                                         .await
                                         .expect("failed to connect to postgres manager");
     // start primary
     let primary_port = free_port();
-    let start_primary_request = StartPrimaryRequest {
-        data_dir: primary_env.data_dir.clone(),
-        port: primary_port.into()
-    };
-    postgresmanager
-        .start_primary(start_primary_request)
-        .await
-        .expect("Starting primary failed");
+    start_primary(&primary_env, &mut pg_manager, primary_port).await;
 
     // insert data in primary
     let usr = std::env::var("USER").unwrap_or_default();
@@ -290,7 +264,7 @@ async fn test_end_to_end_replication() {
 
     // create replication slot
     let slot_name = "test_replication_slot";
-    let create_replication_slot_response = postgresmanager
+    let create_replication_slot_response = pg_manager
         .create_replication_slot(CreateReplicationSlotRequest {
         slot_name: slot_name.to_string()
     })
@@ -314,22 +288,13 @@ async fn test_end_to_end_replication() {
     // launch replica
     let (replica_env, replica_manager_port) = create_env().await;
     let replica_port = free_port();
-    let start_replica_request = StartReplicaRequest {
-        data_dir: replica_env.data_dir.clone(),
-        port: replica_port.into(),
-        primary_host: "127.0.0.1".to_string(),
-        primary_port: primary_port.into(),
-        slot_name: slot_name.to_string()
-    };
     let replica_channel_address = format!("http://127.0.0.1:{}", replica_manager_port);
-    let mut replica_postgresmanager = postgresmanager_connect_with_retry(&replica_channel_address)
+    let mut replica_pg_smanager = postgresmanager_connect_with_retry(&replica_channel_address)
         .await
         .expect("failed to connect to postgres manager");
 
-    replica_postgresmanager
-        .start_replica(start_replica_request)
-        .await
-        .expect("failed to start replica");
+    start_replica(&replica_env, &mut replica_pg_smanager, replica_port, primary_port, slot_name).await;
+
     let replica_connection_string = postgres_connection_string(&usr, "", "127.0.0.1",
                                                                replica_port.into(), "postgres");
     let replica_postgres_client= postgres_connect_with_retry(&replica_connection_string)
@@ -365,23 +330,17 @@ async fn promote_turns_replica_into_primary() {
 
     // create gRPC client
     let channel_address = format!("http://127.0.0.1:{}", primary_manager_port);
-    let mut postgresmanager = postgresmanager_connect_with_retry(&channel_address)
+    let mut pg_manager = postgresmanager_connect_with_retry(&channel_address)
         .await
         .expect("failed to connect to postgres manager");
+
     // start primary
     let primary_port = free_port();
-    let start_primary_request = StartPrimaryRequest {
-        data_dir: primary_env.data_dir.clone(),
-        port: primary_port.into()
-    };
-    postgresmanager
-        .start_primary(start_primary_request)
-        .await
-        .expect("Starting primary failed");
+    start_primary(&primary_env, &mut pg_manager, primary_port).await;
 
     // create replication slot
     let slot_name = "test_replication_slot";
-    let create_replication_slot_response = postgresmanager
+    let create_replication_slot_response = pg_manager
         .create_replication_slot(CreateReplicationSlotRequest {
             slot_name: slot_name.to_string()
         })
@@ -399,22 +358,13 @@ async fn promote_turns_replica_into_primary() {
     // start replica
     let (replica_env, replica_manager_port) = create_env().await;
     let replica_port = free_port();
-    let start_replica_request = StartReplicaRequest {
-        data_dir: replica_env.data_dir.clone(),
-        port: replica_port.into(),
-        primary_host: "127.0.0.1".to_string(),
-        primary_port: primary_port.into(),
-        slot_name: slot_name.to_string()
-    };
+
     let replica_channel_address = format!("http://127.0.0.1:{}", replica_manager_port);
     let mut replica_postgresmanager = postgresmanager_connect_with_retry(&replica_channel_address)
         .await
         .expect("failed to connect to postgres manager");
 
-    replica_postgresmanager
-        .start_replica(start_replica_request)
-        .await
-        .expect("failed to start replica");
+    start_replica(&replica_env, &mut replica_postgresmanager, replica_port, primary_port, slot_name).await;
 
     // ensure recovery  mode is true
     let usr = std::env::var("USER").unwrap_or_default();
@@ -440,6 +390,39 @@ async fn promote_turns_replica_into_primary() {
                                                    "CHECK_REPLICA_RECOVERY_STATUS").await;
     let is_recovery_mode_on: bool = recovery_status_record.get(0);
     assert!(!is_recovery_mode_on, "Recovery mode for replica must be FALSE");
+}
+
+async fn start_primary(env: &TestEnv,
+                       pg_manager: &mut PostgresManagerClient<Channel>,
+                       port: u16) -> StartPrimaryResponse {
+    // start primary
+    let start_primary_request = StartPrimaryRequest {
+        data_dir: env.data_dir.clone(),
+        port: port.into()
+    };
+    pg_manager
+        .start_primary(start_primary_request)
+        .await
+        .expect("Starting primary failed")
+        .into_inner()
+}
+
+async fn start_replica(env: &TestEnv,
+                       pg_manager: &mut PostgresManagerClient<Channel>,
+                       port: u16, primary_port: u16, slot_name: &str) -> StartReplicaResponse {
+    // start replica
+    let start_replica_request = StartReplicaRequest {
+        data_dir: env.data_dir.clone(),
+        port: port.into(),
+        primary_host: "127.0.0.1".to_string(),
+        primary_port: primary_port.into(),
+        slot_name: slot_name.to_string()
+    };
+    pg_manager
+        .start_replica(start_replica_request)
+        .await
+        .expect("Starting replica failed")
+        .into_inner()
 }
 
 async fn run_query(client: &Client, query: &str, params: &[&(dyn ToSql + Sync)], context: &str)
