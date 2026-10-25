@@ -147,3 +147,82 @@ Currently starting: **PostgresManager v0** (Lap 1), in a separate chat/thread. T
 The reference article assumes Kubernetes, but only one component actually depends on it: **Operator** (it's explicitly built as a Kubernetes controller/reconciliation loop over custom resources). Every other component — PostgresManager, Sidecar, Admin, Router, etcd, Replicator — is deployment-agnostic: plain processes talking over gRPC/network, indifferent to whether they run in a pod, a VM, a container, or as bare binaries on a laptop.
 
 Our plan does **not** require Kubernetes. Laps 1–6+ run as plain processes with hardcoded or etcd-based addressing. Kubernetes (or a substitute) only becomes relevant at the very last, optional lap, where Operator would otherwise live — and Operator itself may be replaced with a simpler process supervisor, since it's the least distributed-systems-educational component relative to this project's goals (DS principles + Rust, not Kubernetes).
+
+## PostgresManager
+
+A process that runs beside one Postgres instance, owns its data directory, and starts it as a primary or a replica. It is a pure executor: it makes no placement or election decisions. Those belong to the Operator.
+
+- One manager owns exactly one data dir and one Postgres process.
+- One manager is either a primary or a replica, never both.
+- To run several instances on a host, run several managers, each with its own gRPC port.
+
+## Running
+
+```
+LISTEN_PORT=50051 postgresmanager
+```
+
+- `LISTEN_PORT`: gRPC port on 127.0.0.1 (default `50051`).
+- `postgres`, `initdb`, `pg_basebackup` and `pg_ctl` must be on `PATH`.
+
+## State model
+
+The manager is in one of three states:
+
+| State | Meaning |
+|---|---|
+| `NOT_STARTED` | No instance has been started. |
+| `RUNNING` | A Postgres process it started is alive. Role is `PRIMARY` or `REPLICA`. |
+| `EXITED` | The Postgres process it started has died. Last role and port are still reported. |
+
+State is held in memory only. If the manager restarts, it forgets any Postgres that is still running.
+
+## RPCs
+
+### StartPrimary
+- **Request:** `data_dir`, `port`
+- **Behavior:** runs `initdb` if `data_dir/PG_VERSION` is missing, starts postgres, and returns only after the process's own `postmaster.pid` reports `ready` (10 s deadline). Returns the pid.
+- **Errors:**
+    - `FAILED_PRECONDITION`: an instance is already running (message states role and port).
+    - `INTERNAL`: initdb failed, postgres exited during startup, or readiness timed out.
+
+### CreateReplicationSlot
+- **Request:** `slot_name`
+- **Behavior:** creates a physical replication slot with immediate WAL reservation, and returns its LSN.
+- **Errors:**
+    - `FAILED_PRECONDITION`: nothing is running.
+    - `INTERNAL`: Postgres error, including a duplicate slot name (not idempotent yet).
+
+### StartReplica
+- **Request:** `data_dir`, `port`, `primary_host`, `primary_port`, `slot_name`
+- **Behavior:** runs `pg_basebackup -R` from the primary, sets the data dir to mode 0700, starts postgres, and waits for readiness. The slot must already exist on the primary. Returns the pid.
+- **Errors:** same as StartPrimary, plus `INTERNAL` if `pg_basebackup` fails (for example, the primary is unreachable or the slot is missing).
+
+### Status
+- **Request:** none
+- **Response:** `state`, `role`, `port`, `pid`. Read-only; never changes state.
+- **Conventions:**
+    - `NOT_STARTED`: role `UNSPECIFIED`, port 0, pid 0.
+    - `RUNNING`: all fields real.
+    - `EXITED`: last known role and port, pid 0.
+
+### Promote
+- **Request:** none
+- **Behavior:** runs `pg_ctl promote` on a running replica, and records the role as `PRIMARY`. The same process, pid and port keep running.
+- **Errors:**
+    - `FAILED_PRECONDITION`: nothing is running, or the instance is already a primary.
+    - `INTERNAL`: `pg_ctl promote` failed.
+- **Note:** replication is asynchronous, so commits the replica had not yet received are lost. The manager does not check lag and does not fence the old primary.
+
+## Shutdown
+
+On SIGTERM or Ctrl-C the manager stops accepting requests, runs `pg_ctl stop -m fast` on its Postgres, waits for it to exit, and then exits. If `pg_ctl` fails, it kills the process. SIGKILL gives the manager no chance to clean up, so Postgres is left running.
+
+## Known limitations
+
+- `CreateReplicationSlot` is not idempotent, and is not rejected on a replica.
+- After a manager restart, state is empty even if Postgres is still running (should be detected via `postmaster.pid`).
+- `pg_ctl` and `postgres` are found through `PATH`; there is no configurable bin directory.
+- `Status` does not report replication lag.
+- No fencing, and no way to re-point a replica at a new primary after failover.
+- No authentication or TLS on the gRPC API; it listens on loopback only.

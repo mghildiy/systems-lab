@@ -3,6 +3,7 @@ mod pb {
 }
 
 use tempfile::tempdir;
+use tokio::process::Command;
 use tokio_postgres::{Client, Row};
 use tokio_postgres::types::ToSql;
 use tonic::transport::Channel;
@@ -322,6 +323,45 @@ async fn test_end_to_end_replication() {
                              &[], "CHECK_REPLICA_DATA").await;
     let actual_note: String = replica_data_record.get(0);
     assert_eq!(actual_note, "after replica", "note column value not as expected");
+}
+
+#[tokio::test]
+async fn manager_stops_postgres_on_sigterm() {
+    let (mut env, port) = create_env().await;
+
+    // create gRPC client
+    let channel_address = format!("http://127.0.0.1:{}", port);
+    let mut pg_manager = postgresmanager_connect_with_retry(&channel_address)
+        .await
+        .expect("failed to connect to postgres manager");
+
+    // start primary
+    let primary_port = free_port();
+    start_primary(&env, &mut pg_manager, primary_port).await;
+
+    let usr = std::env::var("USER").unwrap_or_default();
+    let primary_connection_string = postgres_connection_string(&usr, "", "127.0.0.1",
+                                                               primary_port.into(), "postgres");
+    let primary_postgres_client = postgres_connect_with_retry(&primary_connection_string)
+        .await
+        .expect("failed to connect to replica");
+
+    let primary_running_check = run_query(&primary_postgres_client,
+                                           "SELECT 1", &[],
+                                           "PRIMARY_RUNNING_CHECK").await;
+    let value: i32 = primary_running_check.get(0);
+    assert_eq!(value, 1);
+
+    let pid = env.server_process.id().expect("failed to get pid");
+    Command::new("kill")
+        .args(&["-TERM", pid.to_string().as_str()])
+        .output().await.expect("SIGTERM failed");
+    let status = env.server_process.wait().await.expect("waiting for server process to exit failed");
+    assert!(status.success(), "manager should exit cleanly, got {status}");
+
+
+    let result = postgres_connect_with_retry(&primary_connection_string).await;
+    assert!(result.is_err(), "postgres should be down after manager shutdown")
 }
 
 #[tokio::test]

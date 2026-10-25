@@ -4,6 +4,7 @@ use crate::pb::{CreateReplicationSlotRequest, CreateReplicationSlotResponse, Sta
 use crate::service::Role::{Primary, Replica};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Instant;
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
@@ -21,22 +22,21 @@ enum Found {
     Stale,    // a record exists but its postgres has exited
 }
 
-struct RunningInstance {
-    child: Child,
-    port: u32,
-    data_dir: String,
-    role: Role
+pub(crate) struct RunningInstance {
+    pub(crate) child: tokio::process::Child,
+    pub(crate) port: u32,
+    pub(crate) data_dir: String,
+    pub(crate) role: Role,
 }
 
 pub(crate) struct PostgresManagerService {
-    running_instance: Mutex<Option<RunningInstance>>
+    running_instance: Arc<Mutex<Option<RunningInstance>>>
 }
 
 impl PostgresManagerService {
-    pub(crate) fn new() -> Self {
-        let running_instance = Mutex::new(None);
+    pub(crate) fn new(ri: Arc<Mutex<Option<RunningInstance>>>) -> Self {
         PostgresManagerService {
-            running_instance
+            running_instance: ri
         }
     }
 }

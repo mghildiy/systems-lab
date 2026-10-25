@@ -1,30 +1,59 @@
 use std::net::SocketAddr;
+use std::sync::Arc;
+use tokio::process::Command;
+use tokio::sync::Mutex;
+use tonic::Status;
 use tonic::transport::Server;
+use crate::service::{PostgresManagerService, RunningInstance};
 
 mod pb;
 mod service;
 
-// TODO(graceful shutdown): when the manager gets SIGTERM/SIGINT, stop the
-// postgres it owns before exiting. Currently a stopped manager orphans postgres.
-// Plan:
-//  1. Share state with main: Arc<Mutex<Option<RunningInstance>>>, one clone in
-//     the service, one kept in main.
-//  2. Shutdown future: select! over tokio::signal::ctrl_c() and SIGTERM.
-//  3. Replace .serve(addr) with .serve_with_shutdown(addr, shutdown_future).
-//  4. After it returns: lock the state; if Some, run `pg_ctl stop -D <data_dir>
-//     -m fast`, then child.wait().await, then set the slot to None.
-//  5. Test guard: send SIGTERM to the manager instead of calling pg_ctl directly
-//     (start_kill sends SIGKILL, which the manager can't catch).
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let pg_manager = service::PostgresManagerService::new();
+    let state = Arc::new(Mutex::new(None));
+    let service = PostgresManagerService::new(Arc::clone(&state));
     let port = std::env::var("LISTEN_PORT").unwrap_or("50051".to_string());
-    let socker_addr: SocketAddr = format!("127.0.0.1:{}", port).parse::<SocketAddr>().unwrap();
+    let socket_addr: SocketAddr = format!("127.0.0.1:{}", port).parse::<SocketAddr>().unwrap();
     Server::builder()
-        .add_service(pb::postgres_manager_server::PostgresManagerServer::new(pg_manager))
-        .serve(socker_addr)
+        .add_service(pb::postgres_manager_server::PostgresManagerServer::new(service))
+        .serve_with_shutdown(socket_addr, shutdown_signal())
         .await?;
 
+    println!("server stopped, running cleanup");
+    let mut guard = state.lock().await;
+    if let Some(mut ri) = guard.take() {
+        cleanup(&mut ri).await;
+    }
+
     Ok(())
+}
+
+async fn cleanup(ri: &mut RunningInstance) {
+    match Command::new("pg_ctl")
+        .args(&["stop", "-D", &ri.data_dir, "-m", "fast"])
+        .output().await {
+        Ok(out) if out.status.success() => {}
+        Ok(out) => {
+            eprintln!("pg_ctl stop failed ({}): {}", out.status, String::from_utf8_lossy(&out.stderr));
+            let _ = ri.child.kill().await;
+        }
+        Err(e) => eprintln!("could not run pg_ctl stop: {e}"),
+    }
+    if let(Err(e)) = ri.child.wait().await {
+        eprintln!("waiting for postgres to exit failed: {e}");
+        let _ = ri.child.kill().await;
+    }
+}
+
+async fn shutdown_signal() {
+    let mut sigterm = tokio::signal::unix::signal(
+        tokio::signal::unix::SignalKind::terminate(),
+    )
+        .expect("failed to install SIGTERM handler");
+
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {},
+        _ = sigterm.recv() => {},
+    }
 }
