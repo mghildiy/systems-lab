@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["postgresmanager"]
+members = [ "admin", "pgmanager-proto","postgresmanager"]
 
 [workspace.package]
 edition = "2024"

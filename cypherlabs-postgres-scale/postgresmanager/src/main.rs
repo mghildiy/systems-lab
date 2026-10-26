@@ -6,7 +6,7 @@ use tonic::Status;
 use tonic::transport::Server;
 use crate::service::{PostgresManagerService, RunningInstance};
 
-mod pb;
+use pgmanager_proto as pb;
 mod service;
 
 #[tokio::main]

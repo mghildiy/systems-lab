@@ -1,6 +1,4 @@
-mod pb {
-    tonic::include_proto!("cypherlabs.postgres.scale.postgresmanager");
-}
+use pgmanager_proto as pb;
 
 use tempfile::tempdir;
 use tokio::process::Command;
