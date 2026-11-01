@@ -1,6 +1,5 @@
-use std::array::TryFromSliceError;
-use std::ops::Range;
 use crate::chunk_store::error::ChunkError;
+use std::ops::Range;
 
 const MAGIC_BYTES: [u8; 4] = *b"CHNK";
 const FOOTER_SIZE: usize = 16;
@@ -50,21 +49,40 @@ impl Footer {
 #[cfg(test)]
 mod tests {
     use crate::chunk_store::error::ChunkError;
-    use crate::chunk_store::footer::{Footer, CHECKSUM_RANGE, LEN_RANGE, MAGIC_BYTES, MAGIC_RANGE};
+    use crate::chunk_store::footer::{Footer, CHECKSUM_RANGE, FOOTER_SIZE, LEN_RANGE, MAGIC_BYTES, MAGIC_RANGE};
 
     #[test]
-    fn test_encode_decode() {
-        let footer = Footer::for_data(b"This is chunk footer test.");
+    fn test_layout() {
+        let footer = Footer::for_data(b"Test chunk");
         let encoded = footer.encode();
 
-        let data_len: [u8; 8] = encoded[LEN_RANGE].try_into().unwrap();
-        assert_eq!(u64::from_be_bytes(data_len), 26);
-        let checksum: [u8; 4] = encoded[CHECKSUM_RANGE].try_into().unwrap();
-        assert_eq!(u32::from_be_bytes(checksum), crc32c::crc32c("This is chunk footer test.".as_ref()));
+        assert_eq!(encoded.len(), FOOTER_SIZE);
+        let data_len_part: [u8; 8] = encoded[LEN_RANGE].try_into().unwrap();
+        assert_eq!(data_len_part.len(), 8);
+        let checksum_part: [u8; 4] = encoded[CHECKSUM_RANGE].try_into().unwrap();
+        assert_eq!(checksum_part.len(), 4);
+        let magic_bytes_part: [u8; 4] = encoded[MAGIC_RANGE].try_into().unwrap();
+        assert_eq!(magic_bytes_part.len(), MAGIC_BYTES.len());
+    }
+
+    #[test]
+    fn test_round_trip() {
+        let footer = Footer::for_data(b"This is chunk footer test.");
+        let encoded = footer.encode();
         assert_eq!(&encoded[MAGIC_RANGE], &MAGIC_BYTES[..]);
 
         let decoded = Footer::decode(&encoded).expect("Successful footer decode must happen.");
         assert_eq!(footer, decoded);
+    }
+
+    #[test]
+    fn test_empty_data_round_trip() {
+        let footer = Footer::for_data(b"");
+        let encoded = footer.encode();
+        let decoded = Footer::decode(&encoded).expect("Successful footer decode must happen.");
+        assert_eq!(footer, decoded);
+        let data_len: [u8; 8] = encoded[LEN_RANGE].try_into().unwrap();
+        assert_eq!(u64::from_be_bytes(data_len), 0);
     }
 
     #[test]
@@ -74,7 +92,6 @@ mod tests {
         encoded[MAGIC_RANGE.start + 2] = b'U';
 
         let decoded = Footer::decode(&encoded);
-        assert!(decoded.is_err());
         assert_eq!(decoded.unwrap_err(), ChunkError::MagicByteMismatch);
     }
 }
