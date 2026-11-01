@@ -4,3 +4,6 @@ version = "0.1.0"
 edition.workspace = true
 
 [dependencies]
+pgmanager-proto = { path = "../pgmanager-proto" }
+tokio = { version = "1.53.1", features = ["full"] }
+tonic = "0.14.6"
