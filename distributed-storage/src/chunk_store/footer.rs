@@ -2,7 +2,7 @@ use crate::chunk_store::error::ChunkError;
 use std::ops::Range;
 
 const MAGIC_BYTES: [u8; 4] = *b"CHNK";
-const FOOTER_SIZE: usize = 16;
+pub(crate) const FOOTER_SIZE: usize = 16;
 const LEN_RANGE: Range<usize> = 0..8;
 const CHECKSUM_RANGE: Range<usize> = 8..12;
 const MAGIC_RANGE: Range<usize> = 12..16;
@@ -92,6 +92,6 @@ mod tests {
         encoded[MAGIC_RANGE.start + 2] = b'U';
 
         let decoded = Footer::decode(&encoded);
-        assert_eq!(decoded.unwrap_err(), ChunkError::MagicByteMismatch);
+        assert!(matches!(decoded, Err(ChunkError::MagicByteMismatch)));
     }
 }
